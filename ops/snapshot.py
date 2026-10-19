@@ -38,6 +38,11 @@ def main():
         if time.monotonic() - last[0] > 5:
             safe()
             last[0] = time.monotonic()
+    # Pin one read snapshot for this explicit full-backup operation only. Without
+    # it, frequent source writes restart sqlite3_backup from page zero indefinitely.
+    # Hourly sync never uses this long transaction.
+    src.execute('BEGIN')
+    src.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
     try:
         src.backup(dst, pages=2048, progress=progress, sleep=.05)
         dst.execute('PRAGMA journal_mode=DELETE')
