@@ -37,7 +37,11 @@ that receipt, never inferred from the synthetic suite.
 
 ## Remaining gates
 
-- Full-scale run completion and review of its actual results.
+- Full-scale admission and completion: the delegated helper's native submit
+  returned HTTP 409 `heavy admission refused`, as expected for a child agent.
+  No heavy job was admitted or run. The owning parent thread must submit the
+  staged exact spec through the native tool; do not bypass the queue with SSH.
+  Then review the runner's actual receipt.
 - Verified permanent encrypted R2 publication of the sealed months + catalog
   (the existing local-only helper cannot archive an arbitrary remote directory).
 - Verified production reverse-SSH route; a trial with the unprovisioned alias

@@ -243,7 +243,7 @@ def run(cfg):
             return {'bytes': output.stat().st_size, 'fts_indexes': len(names), 'sha256': digest}
         phase('vacuum_and_integrity', vacuum)
         replay_result = results['stock_open_display_replay']['result']
-        results['status'] = 'passed' if not (replay_result['queries_with_misses'] or replay_result['tool_errors'] or replay_result['skipped_profiles']) else 'replay_gaps'
+        results['status'] = 'passed' if not (replay_result['queries_with_misses'] or replay_result['tool_errors'] or replay_result['skipped_profiles'] or replay_result['additional_live_sessions']) else 'replay_gaps'
         results['finished_at'] = time.time()
         atomic_json(evidence, results)
         print(json.dumps({'status': results['status'], 'receipt': str(evidence)}), flush=True)
