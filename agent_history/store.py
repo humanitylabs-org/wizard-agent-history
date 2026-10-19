@@ -52,18 +52,23 @@ def sanitize(row):
     row = dict(row)
     for field in PAYLOAD_FIELDS:
         value = row.get(field)
+        if isinstance(value, bytes) and field in ('codex_reasoning_items', 'reasoning_details', 'codex_message_items', 'api_content'):
+            try:
+                value = value.decode('utf-8')
+            except UnicodeDecodeError as e:
+                raise ValueError('opaque provider metadata is not UTF-8') from e
         if not isinstance(value, str) or not value:
             continue
         try:
             obj = json.loads(value)
         except ValueError:
             # Unknown opaque formats must fail closed, not leak an encrypted blob.
-            if field in ('codex_reasoning_items', 'reasoning_details') and (
-                    'encrypted_content' in value or '"signature"' in value):
+            if field in ('codex_reasoning_items', 'reasoning_details', 'codex_message_items', 'api_content', 'tool_calls') and (
+                    'encrypted_content' in value or (field == 'reasoning_details' and '"signature"' in value)):
                 raise ValueError('unparseable provider metadata; manual format review required')
             continue
         cleaned = strip_opaque(obj, signature=field == 'reasoning_details')
-        if cleaned != obj:
+        if cleaned != obj or isinstance(row.get(field), bytes):
             row[field] = canonical(cleaned).decode()
     return row
 
@@ -87,6 +92,9 @@ def finished(proofs):
 
 
 def ro(path):
+    if isinstance(path, dict):
+        from .source_rpc import RemoteSource
+        return RemoteSource(path)
     c = sqlite3.connect(Path(path).expanduser().resolve().as_uri() + '?mode=ro',
                         uri=True, timeout=0.5, isolation_level=None)
     c.row_factory = sqlite3.Row
@@ -294,15 +302,15 @@ class History:
         with contextlib.closing(ro(source)) as src:
             # Pin source identity to SQLite schema + explicit path; replacing the
             # source is only admitted through accept-trim, not a guessed watermark.
-            source_path = str(Path(source).expanduser().resolve())
+            from .source_rpc import descriptor, identity
+            source_path = descriptor(source)
             if self.get('source') not in (None, source_path):
                 raise ValueError('catalog belongs to a different source')
             self.set('source', source_path)
-            st = Path(source_path).stat()
-            identity = f'{st.st_dev}:{st.st_ino}'
-            if self.get('source_identity') not in (None, identity):
+            source_identity = identity(source, src)
+            if self.get('source_identity') not in (None, source_identity):
                 raise ValueError('source file replaced; explicit rebind required')
-            self.set('source_identity', identity)
+            self.set('source_identity', source_identity)
             generation = int(self.get('generation', 0)) + 1
             self.set('generation', generation)
             self.cat.commit()  # Never reuse a partially completed generation.
@@ -315,7 +323,7 @@ class History:
                 self.cat.execute('INSERT INTO sessions VALUES (?,?)', (s['id'], canonical(dict(s))))
             if src.execute("SELECT 1 FROM sqlite_master WHERE name='system_prompts'").fetchone():
                 for p in src.execute('SELECT hash,prompt FROM system_prompts').fetchall():
-                    self.cat.execute('INSERT OR REPLACE INTO system_prompts VALUES (?,?)', tuple(p))
+                    self.cat.execute('INSERT OR REPLACE INTO system_prompts VALUES (?,?)', (p['hash'], p['prompt']))
             changed = scanned = 0
             # Every pass scans IDs/flags only on old rows. A full payload pass is
             # mandatory before sealing and verification; no long live read txn.
@@ -336,7 +344,8 @@ class History:
             deleted = 0
             while True:
                 missing = self.cat.execute('SELECT * FROM inventory WHERE id>? AND id<=? AND seen<>? '
-                    'AND deleted=0 AND id NOT IN (SELECT id FROM retired) ORDER BY id LIMIT ?',
+                    'AND deleted=0 AND (id NOT IN (SELECT id FROM retired WHERE expected_digest IS NULL) '
+                    'OR session_id NOT IN (SELECT id FROM sessions)) ORDER BY id LIMIT ?',
                     (last, max(high, watermark), generation, BATCH)).fetchall()
                 if not missing:
                     break
@@ -350,7 +359,8 @@ class History:
             self.set('generation', generation)
             self.set('reconciled', int(reconcile))
             self.commit()
-        return dict(scanned=scanned, changed=changed, deleted=deleted,
+        exported = self.export()
+        return dict(scanned=scanned, changed=changed, deleted=deleted, conversation=exported,
                     seconds=round(time.monotonic() - start, 3))
 
     def verify(self, source):
@@ -388,21 +398,33 @@ class History:
             raise ValueError('only past calendar months can be sealed')
         if self.is_sealed(month):
             return {'month': month, 'already_sealed': True}
-        self.sync(source, reconcile=True)
-        self.verify(source)
-        c = self.db(month, True)
-        c.execute("INSERT INTO conversation(conversation) VALUES ('integrity-check')")
-        c.execute("INSERT INTO deep(deep) VALUES ('integrity-check')")
-        c.commit()
-        c.execute('VACUUM')
-        if c.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
-            raise ValueError('month integrity failed')
-        c.close()
-        del self.opened[(month, True)]
-        digest = file_hash(self.dir / (month + '.db'))
-        self.cat.execute('UPDATE months SET sealed=1,sha256=?,verified_at=? WHERE month=?',
-                         (digest, time.time(), month))
-        self.cat.commit()
+        # Sealing is a quiescent-source operation. Hold a reader connection, not
+        # a long read transaction, and reject any observed concurrent commit.
+        from .source_rpc import identity
+        with contextlib.closing(ro(source)) as monitor:
+            def token():
+                if isinstance(source, dict):
+                    info = monitor.rpc({'method': 'info'})
+                    return info['identity'], info['data_version']
+                return identity(source), monitor.execute('PRAGMA data_version').fetchone()[0]
+            before = token()
+            self.sync(source, reconcile=True)
+            self.verify(source)
+            c = self.db(month, True)
+            c.execute("INSERT INTO conversation(conversation) VALUES ('integrity-check')")
+            c.execute("INSERT INTO deep(deep) VALUES ('integrity-check')")
+            c.commit()
+            c.execute('VACUUM')
+            if c.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise ValueError('month integrity failed')
+            c.close()
+            del self.opened[(month, True)]
+            digest = file_hash(self.dir / (month + '.db'))
+            if token() != before:
+                raise ValueError('source changed during sealing; quiesce it and retry')
+            self.cat.execute('UPDATE months SET sealed=1,sha256=?,verified_at=? WHERE month=?',
+                             (digest, time.time(), month))
+            self.cat.commit()
         return {'month': month, 'sha256': digest}
 
     def search(self, query, deep=False, after=None, before=None, limit=20):
@@ -462,7 +484,9 @@ class History:
         for inv in invs[:limit]:
             row = self.stored(inv)
             rows.append(dict(agent=self.agent, month=inv['month'], **row))
-        return {'messages': rows, 'has_more': len(invs) > limit,
+        session = self.cat.execute('SELECT payload FROM sessions WHERE id=?', (session_id,)).fetchone()
+        return {'session': unjson(session[0]) if session else None,
+                'messages': rows, 'has_more': len(invs) > limit,
                 'next_after_id': rows[-1]['id'] if rows else after_id}
 
     def export(self, output=None):
@@ -492,7 +516,13 @@ class History:
                         text = row.get('content')
                         if not text or row.get('_compressed_summary') or text.lstrip().startswith(('[CONTEXT COMPACTION', '[CONTEXT SUMMARY]:')):
                             continue
-                        if row.get('display_kind') in ('internal', 'machine', 'system'):
+                        if row.get('display_kind') in ('internal', 'machine', 'system', 'hidden'):
+                            continue
+                        try:
+                            display_meta = json.loads(row.get('display_metadata') or '{}')
+                        except ValueError:
+                            display_meta = {}
+                        if isinstance(display_meta, dict) and display_meta.get('model_only'):
                             continue
                         if row['role'] == 'assistant' and row.get('tool_calls') not in (None, '', '[]', 'null'):
                             continue

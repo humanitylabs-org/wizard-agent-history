@@ -17,8 +17,9 @@ def main():
     args = p.parse_args()
     os.umask(0o077)
     source, output = Path(args.source).resolve(), Path(args.output).resolve()
-    if output.exists() or output == source:
-        raise ValueError('snapshot destination must be new')
+    partial = output.with_name(output.name + '.partial')
+    if output.exists() or partial.exists() or output == source:
+        raise ValueError('snapshot destination and its .partial must be new')
     def safe():
         now = datetime.now(timezone.utc)
         if now.hour >= 21 or now.hour == 0 and now.minute < 30:
@@ -32,7 +33,7 @@ def main():
     src = sqlite3.connect(source.as_uri() + '?mode=ro', uri=True, timeout=.5)
     src.execute('PRAGMA query_only=ON')
     src.execute('PRAGMA busy_timeout=500')
-    dst = sqlite3.connect(output)
+    dst = sqlite3.connect(partial)
     last = [0.0]
     def progress(status, remaining, total):
         if time.monotonic() - last[0] > 5:
@@ -49,6 +50,9 @@ def main():
     finally:
         dst.close()
         src.close()
+    with open(partial, 'rb') as f:
+        os.fsync(f.fileno())
+    os.replace(partial, output)
     print(json.dumps({'bytes': output.stat().st_size, 'seconds': round(time.monotonic()-start, 3)}))
 
 

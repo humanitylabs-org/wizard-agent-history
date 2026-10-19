@@ -66,6 +66,9 @@ def trim_copy(history, source, output, live_days=30, now=None):
     actual = {}
     try:
         with contextlib.closing(ro(source)) as src, contextlib.closing(sqlite3.connect(building)) as dst, contextlib.closing(sqlite3.connect(ledger_path)) as ledger:
+            version_before = src.execute('PRAGMA data_version').fetchone()[0]
+            src.execute('BEGIN')
+            src.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
             dst.execute('PRAGMA journal_mode=DELETE')
             dst.execute('PRAGMA synchronous=FULL')
             dst.execute('PRAGMA temp_store=FILE')
@@ -159,8 +162,14 @@ def trim_copy(history, source, output, live_days=30, now=None):
             ledger.executemany('INSERT INTO meta VALUES (?,?)', [
                 ('schema', '1'), ('history_agent', history.agent),
                 ('history_root', str(history.dir)), ('source_path', str(source)),
-                ('cutoff', str(cutoff))])
+                ('cutoff', str(cutoff)),
+                ('catalog_generation', history.get('generation', '0')),
+                ('catalog_watermark', history.get('watermark', '0')),
+                ('proofs_sha256', hashlib.sha256(canonical(proofs)).hexdigest())])
             ledger.commit()
+            src.execute('COMMIT')
+            if src.execute('PRAGMA data_version').fetchone()[0] != version_before:
+                raise ValueError('source changed during the copy transaction')
         after_stat = source.stat()
         if (before_stat.st_size, before_stat.st_mtime_ns) != (after_stat.st_size, after_stat.st_mtime_ns):
             raise ValueError('source changed while rebuilding')
@@ -168,8 +177,10 @@ def trim_copy(history, source, output, live_days=30, now=None):
         with open(building, 'rb') as f:
             os.fsync(f.fileno())
         digest = file_hash(building)
-        with sqlite3.connect(ledger_path) as ledger:
+        with contextlib.closing(sqlite3.connect(ledger_path)) as ledger, ledger:
             ledger.execute('INSERT INTO meta VALUES (?,?)', ('output_sha256', digest))
+        with open(ledger_path, 'rb') as f:
+            os.fsync(f.fileno())
         os.replace(building, output)
         dfd = os.open(output.parent, os.O_RDONLY)
         try:
@@ -190,13 +201,19 @@ def accept_trim(history, source, ledger_path):
         meta = dict(ledger.execute('SELECT key,value FROM meta').fetchall())
         if meta.get('history_root') != str(history.dir) or meta.get('history_agent') != history.agent:
             raise ValueError('trim ledger belongs to another history')
-        if file_hash(source) != meta.get('output_sha256'):
+        proofs = {r['session_id']: {'count': r['row_count'], 'sha256': r['content_hash']}
+                  for r in history.cat.execute('SELECT * FROM proofs')}
+        if (meta.get('catalog_generation') != history.get('generation', '0') or
+                meta.get('catalog_watermark') != history.get('watermark', '0') or
+                meta.get('proofs_sha256') != hashlib.sha256(canonical(proofs)).hexdigest()):
+            raise ValueError('History advanced after trim; rebuild from a fresh verified snapshot')
+        from .source_rpc import checksum, descriptor, identity
+        if checksum(source) != meta.get('output_sha256'):
             raise ValueError('source is not the exact verified trim output')
         for r in ledger.execute('SELECT * FROM retired'):
             history.cat.execute('INSERT OR REPLACE INTO retired VALUES (?,?)', tuple(r))
-        history.set('source', str(Path(source).resolve()))
-        st = Path(source).stat()
-        history.set('source_identity', f'{st.st_dev}:{st.st_ino}')
+        history.set('source', descriptor(source))
+        history.set('source_identity', identity(source))
         history.cat.execute('DELETE FROM proofs')
         history.cat.commit()
     return {'accepted': True}

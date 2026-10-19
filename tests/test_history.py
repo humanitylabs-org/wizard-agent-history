@@ -1,4 +1,5 @@
 """All fixtures are synthetic. No owner state is read by the test suite."""
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -105,6 +106,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.sync()['deleted'], 1)
         self.assertEqual(self.h.search('violet'), [])
         self.assertEqual(self.h.read('a')['messages'], [])
+        self.assertNotIn('violet', (self.h.dir / 'conversation.jsonl').read_text())
         self.assertEqual(self.h.db('2020-01').execute('SELECT count(*) FROM messages').fetchone()[0], 0)
 
     def test_edits_full_reconciliation(self):
@@ -178,6 +180,21 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.h.db('2020-01').execute('SELECT count(*) FROM messages').fetchone()[0], 1)
         with self.assertRaises(ValueError):
             self.h.seal(self.source, month_of(time.time()))
+
+    def test_seal_refuses_concurrent_commit(self):
+        from unittest.mock import patch
+        self.add()
+        self.sync()
+        real_verify = self.h.verify
+        def raced_verify(source):
+            result = real_verify(source)
+            self.conn.execute("UPDATE sessions SET title='Synthetic concurrent metadata edit'")
+            self.conn.commit()
+            return result
+        with patch.object(self.h, 'verify', side_effect=raced_verify):
+            with self.assertRaises(ValueError):
+                self.h.seal(self.source, '2020-01')
+        self.assertFalse(self.h.is_sealed('2020-01'))
 
     def test_refuse_sealed_late_edit(self):
         self.add()
@@ -257,6 +274,75 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(self.h.search('reasonretained', deep=True)), 1)
         self.h.verify(output)
 
+    def test_accept_rejects_history_advanced_since_trim(self):
+        self.add(role='tool', active=0, compacted=1)
+        self.verified()
+        output = self.base / 'trimmed.db'
+        result = trim_copy(self.h, self.source, output)
+        self.add(content='Synthetic newer retained message')
+        self.sync()
+        with self.assertRaises(ValueError):
+            accept_trim(self.h, output, result['ledger'])
+
+    def test_privacy_delete_after_trim(self):
+        self.add(role='tool', active=0, compacted=1, content='Synthetic oldtool')
+        i = self.add(role='assistant', active=0, compacted=1, content='Synthetic deletedprose', reasoning='Synthetic old reason')
+        self.add(content='Synthetic stillhere')
+        self.verified()
+        output = self.base / 'trimmed.db'
+        result = trim_copy(self.h, self.source, output)
+        accept_trim(self.h, output, result['ledger'])
+        with contextlib.closing(sqlite3.connect(output)) as c, c:
+            c.execute('DELETE FROM messages WHERE id=?', (i,))
+        self.h.sync(output)
+        self.assertEqual(self.h.search('deletedprose'), [])
+        self.assertEqual(len(self.h.search('oldtool', deep=True)), 1)
+        with contextlib.closing(sqlite3.connect(output)) as c, c:
+            c.execute('DELETE FROM messages')
+            c.execute('DELETE FROM sessions')
+        self.h.sync(output)
+        self.assertEqual(self.h.search('oldtool', deep=True), [])
+
+    def test_structured_opaque_bytes_and_malformed(self):
+        self.add(codex_reasoning_items=b'[{"encrypted_content":"SyntheticOpaque","text":"SyntheticReadable"}]')
+        self.sync()
+        self.assertNotIn('SyntheticOpaque', canonical(self.h.read('a')).decode())
+        with self.assertRaises(ValueError):
+            sanitize({'api_content': '{"encrypted_content":bad'})
+        self.assertEqual(sanitize({'reasoning': 'Discuss encrypted_content as readable code'})['reasoning'],
+                         'Discuss encrypted_content as readable code')
+
+    def test_tool_call_display_identity_is_preserved(self):
+        call = '[{"function":{"name":"synthetic_fixture"}}]'
+        i = self.add(role='assistant', active=0, compacted=1, reasoning='Synthetic reasoning', tool_calls=call)
+        self.verified()
+        output = self.base / 'trimmed.db'
+        trim_copy(self.h, self.source, output)
+        c = ro(output)
+        self.assertEqual(c.execute('SELECT tool_calls FROM messages WHERE id=?', (i,)).fetchone()[0], call)
+        c.close()
+
+    def test_concurrent_wal_change_refuses_publish(self):
+        from unittest.mock import patch
+        from agent_history.trim import trim_row as original_trim_row
+        i = self.add(role='tool', active=0, compacted=1)
+        self.conn.execute('PRAGMA journal_mode=WAL')
+        self.conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        self.verified()
+        fired = []
+        def race(row, cutoff):
+            if not fired:
+                self.conn.execute('UPDATE messages SET active=1 WHERE id=?', (i,))
+                self.conn.commit()
+                fired.append(True)
+            return original_trim_row(row, cutoff)
+        output = self.base / 'trimmed.db'
+        with patch('agent_history.trim.trim_row', side_effect=race):
+            with self.assertRaises(ValueError):
+                trim_copy(self.h, self.source, output)
+        self.assertTrue(fired)
+        self.assertFalse(output.exists())
+
     def test_live_guard_and_existing_output(self):
         with self.assertRaises(ValueError):
             guard_copy(Path.home() / '.hermes/state.db', self.base / 'out.db')
@@ -274,6 +360,29 @@ class HistoryTests(unittest.TestCase):
         c = self.h.db('2020-01', True)
         c.execute("INSERT INTO conversation(conversation) VALUES ('integrity-check')")
         self.assertEqual(len(self.h.search('violet')), 1)
+
+    def test_source_rpc_sync_readonly_transport(self):
+        from unittest.mock import patch
+        original_popen = subprocess.Popen
+        self.add(display_identity=b'abc')
+        self.conn.execute("INSERT INTO system_prompts VALUES ('fixture-hash','Synthetic prompt')")
+        self.conn.commit()
+        before = file_hash(self.source)
+        def local_transport(argv, **kwargs):
+            return original_popen([sys.executable, '-m', 'agent_history', 'source-serve',
+                                   '--source', str(self.source)], **kwargs)
+        config = {'ssh': 'synthetic-host', 'repo': '/synthetic/repo', 'python': '/synthetic/python', 'path': '/synthetic/source'}
+        with patch('agent_history.source_rpc.subprocess.Popen', side_effect=local_transport):
+            self.assertEqual(self.h.sync(config)['changed'], 1)
+            self.assertEqual(self.h.sync(config)['changed'], 0)
+            self.assertEqual(self.h.verify(config)['rows'], 1)
+        self.assertEqual(self.h.cat.execute('SELECT prompt FROM system_prompts').fetchone()[0], 'Synthetic prompt')
+        self.assertEqual(file_hash(self.source), before)
+        request = canonical({'method': 'query', 'sql': 'DELETE FROM messages'}) + b'\n'
+        result = subprocess.run([sys.executable, '-m', 'agent_history', 'source-serve', '--source', str(self.source)],
+                                input=request, capture_output=True, check=True)
+        self.assertIn('error', json.loads(result.stdout))
+        self.assertEqual(file_hash(self.source), before)
 
     def test_mcp_stdio(self):
         self.add()

@@ -57,6 +57,8 @@ def main(argv=None):
     p.add_argument('--root', default=os.getenv('AGENT_HISTORY_ROOT'))
     p.add_argument('--agent', default=None)
     sub = p.add_subparsers(dest='cmd', required=True)
+    source_server = sub.add_parser('source-serve')
+    source_server.add_argument('--source', required=True)
     for name in ('sync', 'verify', 'seal', 'trim-copy', 'accept-trim'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--source')
@@ -84,6 +86,10 @@ def main(argv=None):
     sub.add_parser('stats')
     sub.add_parser('mcp')
     args = p.parse_args(argv)
+    if args.cmd == 'source-serve':
+        from .source_rpc import serve
+        serve(args.source)
+        return
     cfg = json.loads(Path(args.config).expanduser().read_text()) if args.config else {}
     root = args.root or cfg.get('root')
     if not root:
