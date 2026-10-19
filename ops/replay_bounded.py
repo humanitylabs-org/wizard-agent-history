@@ -114,7 +114,6 @@ def run(cfg, wall_seconds, call_timeout, sample, replay_only=False):
     rehearsal = json.loads((root / 'acceptance.json').read_text())
     trimmed = root / 'trimmed.db'
     source = Path(cfg['source']).resolve()
-    deadline = time.monotonic() + wall_seconds
     receipt = {'status': 'running', 'started_at': time.time(), 'wall_seconds': wall_seconds,
                'call_timeout_seconds': call_timeout,
                'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()}
@@ -172,6 +171,7 @@ def run(cfg, wall_seconds, call_timeout, sample, replay_only=False):
             done[r['query_sha256']] = r
     worker = Worker(dict(cfg, source=str(source), trimmed=str(trimmed)), env)
     worker.start(timeout=900)
+    deadline = time.monotonic() + wall_seconds  # replay budget only
     try:
         with log.open('a') as out:
             for key, args in keyed:
@@ -239,7 +239,7 @@ if __name__ == '__main__':
     os.umask(0o077)
     p = argparse.ArgumentParser()
     p.add_argument('--config', required=True)
-    p.add_argument('--wall-seconds', type=int, default=4 * 3600)
+    p.add_argument('--wall-seconds', type=int, default=4 * 3600, help='replay budget; checkpoints survive it')
     p.add_argument('--call-timeout', type=int, default=180)
     p.add_argument('--sample', type=int, default=0, help='0 = all frozen queries')
     p.add_argument('--replay-only', action='store_true', help='smoke: skip full-file hashing/integrity')
