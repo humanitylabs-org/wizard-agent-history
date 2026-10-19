@@ -51,6 +51,8 @@ def strip_opaque(value, signature=False):
 def sanitize(row):
     row = dict(row)
     for field in PAYLOAD_FIELDS:
+        if field == 'tool_calls':
+            continue  # Function arguments are owner data, not provider metadata.
         value = row.get(field)
         if isinstance(value, bytes) and field in ('codex_reasoning_items', 'reasoning_details', 'codex_message_items', 'api_content'):
             try:
@@ -114,6 +116,23 @@ def batches(c, columns='*', high=None):
         if not rows:
             break
         last = rows[-1]['id']
+        yield rows
+
+
+def metadata_batches(c, table, key):
+    if (table, key) not in (('sessions', 'id'), ('system_prompts', 'hash')):
+        raise ValueError('unsupported metadata relation')
+    last = None
+    first = True
+    while True:
+        rows = (c.execute(f'SELECT * FROM {table} ORDER BY {key} LIMIT ?', (BATCH,)) if first else
+                c.execute(f'SELECT * FROM {table} WHERE {key}>? ORDER BY {key} LIMIT ?', (last, BATCH))).fetchall()
+        if not rows:
+            break
+        first = False
+        last = rows[-1][key]
+        if last is None:
+            raise ValueError('null metadata key is unsupported')
         yield rows
 
 
@@ -314,29 +333,35 @@ class History:
             generation = int(self.get('generation', 0)) + 1
             self.set('generation', generation)
             self.cat.commit()  # Never reuse a partially completed generation.
+            if src.execute('SELECT 1 FROM messages WHERE id<=0 LIMIT 1').fetchone():
+                raise ValueError('nonpositive Hermes message IDs are unsupported; nothing may be trimmed')
             high = src.execute('SELECT coalesce(max(id),0) FROM messages').fetchone()[0]
             watermark = int(self.get('watermark', 0))
             self.cat.execute('DELETE FROM proofs')
             self.cat.execute('DELETE FROM sessions')
             # Metadata is small and is refreshed even when there are no new messages.
-            for s in src.execute('SELECT * FROM sessions').fetchall():
-                self.cat.execute('INSERT INTO sessions VALUES (?,?)', (s['id'], canonical(dict(s))))
+            for metadata in metadata_batches(src, 'sessions', 'id'):
+                for s in metadata:
+                    self.cat.execute('INSERT INTO sessions VALUES (?,?)', (s['id'], canonical(dict(s))))
             if src.execute("SELECT 1 FROM sqlite_master WHERE name='system_prompts'").fetchone():
-                for p in src.execute('SELECT hash,prompt FROM system_prompts').fetchall():
-                    self.cat.execute('INSERT OR REPLACE INTO system_prompts VALUES (?,?)', (p['hash'], p['prompt']))
+                for metadata in metadata_batches(src, 'system_prompts', 'hash'):
+                    for p in metadata:
+                        self.cat.execute('INSERT OR REPLACE INTO system_prompts VALUES (?,?)', (p['hash'], p['prompt']))
             changed = scanned = 0
             # Every pass scans IDs/flags only on old rows. A full payload pass is
             # mandatory before sealing and verification; no long live read txn.
             for batch in batches(src, 'id,active,compacted', high):
                 ids = [r['id'] for r in batch]
                 wanted = ids if reconcile else [i for i in ids if i > watermark]
+                loaded = set()
                 if wanted:
                     marks = ','.join('?' for _ in wanted)
                     full = src.execute(f'SELECT * FROM messages WHERE id IN ({marks}) ORDER BY id', wanted).fetchall()
                     for row in full:
                         changed += self.put(row, generation)
+                        loaded.add(row['id'])
                 self.cat.executemany('UPDATE inventory SET active=?,compacted=?,seen=? WHERE id=?',
-                                     [(r['active'], r['compacted'], generation, r['id']) for r in batch])
+                                     [(r['active'], r['compacted'], generation, r['id']) for r in batch if r['id'] not in loaded])
                 scanned += len(batch)
                 self.commit()
             # Missing rows are owner deletions, except an explicitly accepted trim.
@@ -366,7 +391,11 @@ class History:
     def verify(self, source):
         start = time.monotonic()
         proofs = {}
+        self.cat.execute('DELETE FROM proofs')
+        self.cat.commit()
+        from .source_rpc import source_token
         with contextlib.closing(ro(source)) as src:
+            before = source_token(source, src)
             for batch in batches(src):
                 for raw in batch:
                     row = sanitize(raw)
@@ -382,10 +411,14 @@ class History:
                         raise ValueError('source flags changed; sync again')
                     accumulate(proofs, row, row_hash(row))
             count = sum(p[0] for p in proofs.values())
+            if count != src.execute('SELECT count(*) FROM messages').fetchone()[0]:
+                raise ValueError('source count changed or an unsupported ID was skipped')
             expected = self.cat.execute('SELECT count(*) FROM inventory WHERE deleted=0 '
                        'AND id NOT IN (SELECT id FROM retired WHERE expected_digest IS NULL)').fetchone()[0]
             if count != expected:
                 raise ValueError('row count mismatch; reconcile deletions before verification')
+            if source_token(source, src) != before:
+                raise ValueError('source changed during verification; quiesce it and retry')
         result = finished(proofs)
         self.cat.execute('DELETE FROM proofs')
         self.cat.executemany('INSERT INTO proofs VALUES (?,?,?,?)',
@@ -492,8 +525,13 @@ class History:
     def export(self, output=None):
         output = Path(output) if output else self.dir / 'conversation.jsonl'
         temp = output.with_name(output.name + '.partial')
+        if temp.exists() or temp.is_symlink():
+            if output == self.dir / 'conversation.jsonl' and temp.is_file() and not temp.is_symlink():
+                temp.unlink()  # Exclusive History writer lock owns this derived artifact.
+            else:
+                raise ValueError('export partial exists outside the owned default export')
         count, seen = 0, set()
-        sessions = {r['id']: unjson(r['payload']) for r in self.cat.execute('SELECT * FROM sessions')}
+        sources = {r['id']: unjson(r['payload']).get('source') for r in self.cat.execute('SELECT * FROM sessions')}
         with open(temp, 'xb') as f:
             for month, in self.cat.execute('SELECT month FROM months ORDER BY month').fetchall():
                 c = self.db(month)
@@ -509,10 +547,9 @@ class History:
                                                'AND (active=1 OR compacted=1)', (stored['id'],)).fetchone()
                         if not inv:
                             continue
-                        row = unpack(stored)
-                        meta = sessions.get(row['session_id'], {})
-                        if meta.get('source') not in HUMAN_SOURCES or meta.get('parent_session_id') and meta.get('source') == 'subagent':
+                        if sources.get(stored['session_id']) not in HUMAN_SOURCES:
                             continue
+                        row = unpack(stored)
                         text = row.get('content')
                         if not text or row.get('_compressed_summary') or text.lstrip().startswith(('[CONTEXT COMPACTION', '[CONTEXT SUMMARY]:')):
                             continue

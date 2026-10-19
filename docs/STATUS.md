@@ -23,6 +23,12 @@ writers could restart copying; the helper was corrected to pin the explicit
 snapshot (hourly sync still uses short reads). No production database, WAL,
 configuration, gateway or timer was changed.
 
+The snapshot was transferred through a temporary client-side-encrypted object-
+store transport and verified by complete decrypted SHA-256 on the storage host.
+The VPS snapshot, transport ciphertext and per-transfer keys were deleted after
+verification. The source host again had 116 GiB available; the retained external
+acceptance directory occupied 26 GiB before the full-size run.
+
 The exact stock Hermes revision was fetched from upstream and checked out clean
 on the external acceptance volume. Full-size acceptance is **not yet claimed**.
 The durable run must produce its checkpointed `acceptance.json`; real rows,
@@ -36,7 +42,10 @@ that receipt, never inferred from the synthetic suite.
   (the existing local-only helper cannot archive an arbitrary remote directory).
 - Verified production reverse-SSH route; a trial with the unprovisioned alias
   correctly failed host-key validation. No validation was bypassed.
-- Fresh frozen review including the SSH adapter, remote cutover and rollback.
+- Fresh frozen review of the final corrections and remote cutover/rollback.
+- GitHub-hosted CI is blocked before any test step by the organization's billing/
+  spending-limit gate. The Actions annotation explicitly says the job did not
+  start; this is not a failing synthetic test. No billing changes were attempted.
 - Owner-approved physical-erasure/resealing policy and handling of edits to
   already retired rows. v0 fails closed rather than guessing.
 

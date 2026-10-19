@@ -40,7 +40,9 @@ def trim_row(row, cutoff):
         return row
     if row['role'] == 'tool':
         return None
-    new = dict(row)
+    # Preserve readable API/display payloads while excluding nested opaque
+    # provider content from old inactive rows too; never alter tool-call keys.
+    new = sanitize(row)
     for key in STRIP:
         if key in new:
             new[key] = None
@@ -118,7 +120,7 @@ def trim_copy(history, source, output, live_days=30, now=None):
                         dst.commit()
                         ledger.commit()
                 else:
-                    cur = src.execute(f'SELECT * FROM {quoted(name)}')
+                    cur = src.execute(f'SELECT {",".join(map(quoted, cols))} FROM {quoted(name)}')
                     while rows := cur.fetchmany(400):
                         dst.executemany(insert, [tuple(row) for row in rows])
                         dst.commit()
@@ -207,13 +209,20 @@ def accept_trim(history, source, ledger_path):
                 meta.get('catalog_watermark') != history.get('watermark', '0') or
                 meta.get('proofs_sha256') != hashlib.sha256(canonical(proofs)).hexdigest()):
             raise ValueError('History advanced after trim; rebuild from a fresh verified snapshot')
-        from .source_rpc import checksum, descriptor, identity
-        if checksum(source) != meta.get('output_sha256'):
-            raise ValueError('source is not the exact verified trim output')
-        for r in ledger.execute('SELECT * FROM retired'):
-            history.cat.execute('INSERT OR REPLACE INTO retired VALUES (?,?)', tuple(r))
-        history.set('source', descriptor(source))
-        history.set('source_identity', identity(source))
-        history.cat.execute('DELETE FROM proofs')
-        history.cat.commit()
+        from .source_rpc import attestation, descriptor
+        try:
+            with attestation(source) as proof:
+                if proof['sha256'] != meta.get('output_sha256'):
+                    raise ValueError('source is not the exact verified trim output')
+                for r in ledger.execute('SELECT * FROM retired'):
+                    history.cat.execute('INSERT OR REPLACE INTO retired VALUES (?,?)', tuple(r))
+                history.set('source', descriptor(source))
+                history.set('source_identity', proof['identity'])
+                history.cat.execute('DELETE FROM proofs')
+            # The same source monitor rechecks the attested identity/content token
+            # on context exit. Nothing is committed if that check fails.
+            history.cat.commit()
+        except BaseException:
+            history.cat.rollback()
+            raise
     return {'accepted': True}

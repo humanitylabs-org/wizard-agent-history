@@ -3,7 +3,9 @@
 No listening service, credentials, tunnels, or network-mounted SQLite databases.
 The authenticated SSH owner launches this short-lived stdio process on the source.
 """
+import contextlib
 import hashlib
+import os
 import json
 from pathlib import Path
 import re
@@ -90,15 +92,40 @@ def identity(source, connection=None):
     return f'{stat.st_dev}:{stat.st_ino}'
 
 
-def checksum(source):
-    from .store import file_hash
+def source_token(source, connection):
     if isinstance(source, dict):
-        c = RemoteSource(source)
-        try:
-            return c.rpc({'method': 'checksum'})['sha256']
-        finally:
-            c.close()
-    return file_hash(source)
+        return connection.rpc({'method': 'info'})['token']
+    st = Path(source).expanduser().resolve().stat()
+    return [f'{st.st_dev}:{st.st_ino}', st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+            connection.execute('PRAGMA data_version').fetchone()[0]]
+
+
+def local_attestation(source, connection):
+    path = Path(source).expanduser().resolve()
+    wal = Path(str(path) + '-wal')
+    if wal.exists() and wal.stat().st_size:
+        raise ValueError('attestation requires a checkpointed, stopped source')
+    before = source_token(path, connection)
+    # Hash an open descriptor, never repeatedly resolve a potentially replaced path.
+    with path.open('rb') as f:
+        st = os.fstat(f.fileno())
+        if [f'{st.st_dev}:{st.st_ino}', st.st_size, st.st_mtime_ns, st.st_ctime_ns] != before[:4]:
+            raise ValueError('source replaced before checksum')
+        digest = hashlib.file_digest(f, 'sha256').hexdigest()
+    if source_token(path, connection) != before or (wal.exists() and wal.stat().st_size):
+        raise ValueError('source changed during checksum')
+    return {'sha256': digest, 'identity': before[0], 'token': before}
+
+
+@contextlib.contextmanager
+def attestation(source):
+    from .store import ro
+    with contextlib.closing(ro(source)) as connection:
+        proof = (connection.rpc({'method': 'checksum'}) if isinstance(source, dict) else
+                 local_attestation(source, connection))
+        yield proof
+        if source_token(source, connection) != proof['token']:
+            raise ValueError('attested source changed before acceptance')
 
 
 def serve(source):
@@ -111,7 +138,8 @@ def serve(source):
                 request = unjson(line)
                 method = request['method']
                 if method == 'info':
-                    result = {'identity': identity(path), 'data_version': connection.execute('PRAGMA data_version').fetchone()[0]}
+                    token = source_token(path, connection)
+                    result = {'identity': token[0], 'data_version': token[-1], 'token': token}
                 elif method == 'query':
                     sql = request['sql']
                     if not sql.lstrip().upper().startswith('SELECT '):
@@ -120,15 +148,7 @@ def serve(source):
                     rows = cur.fetchall()  # Client issues ID-range LIMIT batches.
                     result = {'columns': [c[0] for c in cur.description], 'rows': [list(r) for r in rows]}
                 elif method == 'checksum':
-                    wal = Path(str(path) + '-wal')
-                    if wal.exists() and wal.stat().st_size:
-                        raise ValueError('checksum requires a checkpointed, stopped source')
-                    before = path.stat()
-                    sha = file_hash(path)
-                    after = path.stat()
-                    if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns) or (wal.exists() and wal.stat().st_size):
-                        raise ValueError('source changed during checksum')
-                    result = {'sha256': sha}
+                    result = local_attestation(path, connection)
                 else:
                     raise ValueError('unknown source method')
             except Exception as e:

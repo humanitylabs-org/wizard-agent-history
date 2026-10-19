@@ -61,7 +61,8 @@ SSH; no inbound network listener is opened.
 
 Keep **every active row, at every age, byte-for-byte** for provider continuation.
 For inactive rows older than `live_days` (30 by default), drop tool-output rows
-and clear reasoning payload fields. Keep every user/assistant prose row, all
+and clear reasoning payload fields, also removing nested opaque provider fields
+while retaining readable API/display data. Keep every user/assistant prose row, all
 display metadata, and **tool calls**, which participate in stock Hermes display
 deduplication. Recent inactive rows are untouched too.
 

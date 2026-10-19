@@ -384,6 +384,74 @@ class HistoryTests(unittest.TestCase):
         self.assertIn('error', json.loads(result.stdout))
         self.assertEqual(file_hash(self.source), before)
 
+    def test_verify_refuses_concurrent_same_count_edit(self):
+        from unittest.mock import patch
+        from agent_history.store import batches as original_batches
+        self.add()
+        self.sync()
+        def racing_batches(c, *args, **kwargs):
+            for batch in original_batches(c, *args, **kwargs):
+                yield batch
+                self.conn.execute("UPDATE messages SET content='Synthetic changed during verify'")
+                self.conn.commit()
+        with patch('agent_history.store.batches', side_effect=racing_batches):
+            with self.assertRaises(ValueError):
+                self.h.verify(self.source)
+        self.assertEqual(self.h.cat.execute('SELECT count(*) FROM proofs').fetchone()[0], 0)
+
+    def test_accept_refuses_source_mutation_before_commit(self):
+        from unittest.mock import patch
+        self.add(role='assistant', active=0, compacted=1, reasoning='Synthetic old reasoning')
+        self.verified()
+        output = self.base / 'trimmed.db'
+        result = trim_copy(self.h, self.source, output)
+        setter = self.h.set
+        def race(key, value):
+            if key == 'source':
+                with contextlib.closing(sqlite3.connect(output)) as c, c:
+                    c.execute("UPDATE messages SET content='Synthetic changed after hash'")
+            setter(key, value)
+        with patch.object(self.h, 'set', side_effect=race):
+            with self.assertRaises(ValueError):
+                accept_trim(self.h, output, result['ledger'])
+        self.assertEqual(self.h.cat.execute('SELECT count(*) FROM retired').fetchone()[0], 0)
+
+    def test_generated_auxiliary_column(self):
+        self.add()
+        self.conn.execute('CREATE TABLE synthetic_extra(a INTEGER,b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL)')
+        self.conn.execute('INSERT INTO synthetic_extra(a) VALUES (3)')
+        self.conn.commit()
+        self.verified()
+        output = self.base / 'trimmed.db'
+        trim_copy(self.h, self.source, output)
+        with contextlib.closing(ro(output)) as c:
+            self.assertEqual(tuple(c.execute('SELECT * FROM synthetic_extra').fetchone()), (3, 6))
+
+    def test_inactive_nested_opaque_is_removed_but_calls_preserved(self):
+        calls = '[{"function":{"name":"fixture","arguments":{"encrypted_content":"SyntheticOwnerArgument"}}}]'
+        self.add(active=0, compacted=1, api_content='[{"text":"Synthetic readable","encrypted_content":"SyntheticOpaque"}]', tool_calls=calls)
+        self.verified()
+        output = self.base / 'trimmed.db'
+        trim_copy(self.h, self.source, output)
+        with contextlib.closing(ro(output)) as c:
+            row = c.execute('SELECT api_content,tool_calls FROM messages').fetchone()
+            self.assertNotIn('SyntheticOpaque', row[0])
+            self.assertIn('Synthetic readable', row[0])
+            self.assertEqual(row[1], calls)
+        self.assertEqual(self.h.read('a')['messages'][0]['tool_calls'], calls)
+
+    def test_stale_default_export_recovers(self):
+        self.add()
+        (self.h.dir / 'conversation.jsonl.partial').write_text('Synthetic interrupted export')
+        self.sync()
+        self.assertIn('violet', (self.h.dir / 'conversation.jsonl').read_text())
+        self.assertFalse((self.h.dir / 'conversation.jsonl.partial').exists())
+
+    def test_nonpositive_message_id_refuses_sync(self):
+        self.add(id=0)
+        with self.assertRaises(ValueError):
+            self.sync()
+
     def test_mcp_stdio(self):
         self.add()
         self.sync()

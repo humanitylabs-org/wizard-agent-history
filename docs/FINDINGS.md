@@ -105,6 +105,9 @@ post-trim privacy deletion, and preservation of display-key tool calls.
 
 The reviewer also identified the intentionally limited post-seal physical
 privacy policy and fail-closed post-trim edits. They are documented limitations,
-not claims of completed archive-native erasure/revision support. The initial
-review predates the later SSH-source adapter; that adapter needs a final frozen
-review before production admission.
+not claims of completed archive-native erasure/revision support. A second read-only review included the SSH adapter and found verification and
+acceptance race windows, stale export recovery, and generated-column copying.
+These now have source-token/descriptor attestation, failure-invalidated proofs,
+a same-monitor acceptance check, owned partial-export recovery and explicit
+insertable-column selects. Regressions exercise those failures. The final
+corrections still need a frozen approval before production admission.
