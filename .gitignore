@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+*.db
+*.db-*
+*.jsonl
+*.partial
+*.building
+config.local.json
+evidence/private/
