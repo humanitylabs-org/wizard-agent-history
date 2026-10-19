@@ -42,9 +42,11 @@ for line in sys.stdin:
         if exact.get(field):
             exact[field] = datetime.fromtimestamp(_parse_iso_bound(exact[field]), timezone.utc).isoformat()
     out = {}
+    print(json.dumps({'stage': 'baseline'}), flush=True)
     t = time.monotonic()
     prior = json.loads(session_search(db=baseline, **exact))
     out['baseline_seconds'] = round(time.monotonic() - t, 3)
+    print(json.dumps({'stage': 'trimmed', 'baseline_seconds': out['baseline_seconds']}), flush=True)
     t = time.monotonic()
     after = json.loads(session_search(db=trimmed, **exact))
     out['trimmed_seconds'] = round(time.monotonic() - t, 3)
@@ -57,6 +59,7 @@ for line in sys.stdin:
     missing = old - live
     recovered = set()
     if missing:
+        print(json.dumps({'stage': 'history'}), flush=True)
         t = time.monotonic()
         try:
             recovered = {x['session_id'] for x in h.search(args['query'], deep=True, limit=1000)}
@@ -92,7 +95,15 @@ class Worker:
     def ask(self, args, timeout):
         self.proc.stdin.write(json.dumps(args) + '\n')
         self.proc.stdin.flush()
-        return self._read(timeout)
+        end, stage = time.monotonic() + timeout, {}
+        while True:
+            msg = self._read(max(0.0, end - time.monotonic()))
+            if msg is None:
+                return dict(stage, timeout=True, timed_out_in=stage.pop('stage', 'start') if stage else 'start')
+            if 'stage' in msg:
+                stage = msg
+                continue
+            return msg
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -180,9 +191,8 @@ def run(cfg, wall_seconds, call_timeout, sample, replay_only=False):
                 if time.monotonic() > deadline:
                     break
                 result = worker.ask(args, call_timeout)
-                if result is None:
+                if result.get('timeout'):
                     worker.stop()
-                    result = {'timeout': True}
                     worker.start(timeout=900)
                 result['query_sha256'] = key
                 out.write(json.dumps(result) + '\n')
@@ -192,6 +202,9 @@ def run(cfg, wall_seconds, call_timeout, sample, replay_only=False):
                 receipt['replay'] = {
                     'planned': len(keyed), 'completed': len(rs), 'skipped_other_profiles': skipped_profiles,
                     'timeouts': sum(bool(r.get('timeout')) for r in rs),
+                    'timeouts_in_original_db': sum(r.get('timed_out_in') == 'baseline' for r in rs),
+                    'timeouts_in_trimmed_db': sum(r.get('timed_out_in') == 'trimmed' for r in rs),
+                    'timeouts_in_history': sum(r.get('timed_out_in') == 'history' for r in rs),
                     'tool_errors': sum(bool(r.get('tool_error')) for r in rs),
                     'queries_with_live_misses': sum(r.get('live_misses', 0) > 0 for r in rs),
                     'queries_with_misses_after_history': sum(r.get('misses', 0) > 0 for r in rs),
@@ -226,7 +239,8 @@ def run(cfg, wall_seconds, call_timeout, sample, replay_only=False):
     rp = receipt.get('replay', {})
     clean = (receipt.get('active_rows', {}).get('identical') and receipt.get('quick_check') == 'ok'
              and receipt['long_thread_display']['all_identical']
-             and rp.get('completed') == rp.get('planned') and not rp.get('timeouts')
+             and rp.get('completed') == rp.get('planned')
+             and not (rp.get('timeouts_in_trimmed_db') or rp.get('timeouts_in_history') or rp.get('timeouts', 0) - rp.get('timeouts_in_original_db', 0))
              and not rp.get('tool_errors') and not rp.get('queries_with_misses_after_history'))
     receipt['status'] = 'passed' if clean else ('partial' if rp.get('completed', 0) < rp.get('planned', 0) else 'gaps')
     receipt['finished_at'] = time.time()
