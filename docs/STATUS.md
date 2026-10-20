@@ -55,3 +55,12 @@ that receipt, never inferred from the synthetic suite.
 
 This is a runnable preview increment, **not cutover-ready** until those gates
 are closed. The live Hermes store remains untouched.
+
+## Full-size replay result (20 Oct 2026, Thales copy, commits c0997b7 → 274ac24)
+
+- Artifacts: source and trimmed copies match the rehearsal checksums; `quick_check` ok; 749,116 active rows identical; the five longest old human threads (31,376 / 6,767 / 6,528 / 4,323 / 4,117 visible rows) display identically through stock paging.
+- 1,153 real `session_search` calls from the last 30 days replayed with stock Hermes 818c13be1d on both stores.
+  - 1,144 return the same top-K sessions. 9 differ by one swap at the last rank. In all 5 cases left after History, the dropped session is still returned by the trimmed store at rank K+1 (BM25 statistics shift when inactive rows leave). No session lost coverage.
+  - 56 timeouts under a shared 60 s cap: 42 on the original store; 14 attributed to the trimmed store only because the original consumed 37–47 s of the cap first. Re-run alone, all 14 finish on the trimmed store in 0.4–27 s.
+- Defect fixed: History search rejected Hermes query syntax (`OR`, quotes, `:`), raising "invalid FTS query". It now uses Hermes' sanitizer (vendored, MIT); regression test added (35 tests pass on VPS and Thales).
+- Size: 27.5 GB → 20.2 GB on the copy (−27%), because every active row and all visible prose stay at every age.
