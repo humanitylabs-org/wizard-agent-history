@@ -12,6 +12,7 @@ import re
 import sqlite3
 import time
 from compression import zstd
+from agent_history.fts_query import sanitize_fts5_query
 
 VERSION = 1
 BATCH = 400
@@ -465,6 +466,10 @@ class History:
             return []
         limit = max(1, min(int(limit), 1000))
         after, before = bound(after), bound(before)
+        # Accept the same query text agents send to Hermes session_search.
+        query = sanitize_fts5_query(query)
+        if not query:
+            return []
         hits = []
         for m in self.cat.execute('SELECT month FROM months ORDER BY month DESC').fetchall():
             month = m[0]

@@ -89,6 +89,14 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.sync()['changed'], 1)
         self.assertEqual(self.h.search('violet')[0]['title'], 'Renamed synthetic title')
 
+    def test_hermes_query_syntax(self):
+        # Agents send Hermes session_search syntax; History must accept it too.
+        self.add(content='Synthetic chat-send violet garden: done (ok)')
+        self.sync()
+        for q in ('"violet garden" OR tulip', 'chat-send', 'garden: done', 'OR violet', 'violet (ok', '"unbalanced violet'):
+            self.assertEqual(len(self.h.search(q)), 1, q)
+        self.assertEqual(self.h.search('!!! ()'), [])
+
     def test_mutable_flags(self):
         i = self.add()
         self.sync()
