@@ -76,3 +76,8 @@ are closed. The live Hermes store remains untouched.
 2. 1,942,338 visible rows (6,143 sessions) have no display identity yet; Hermes fills them on first view. Verify/trim must treat display_order/display_identity as display state, not content, or the window's verify fails closed.
 3. VPS→Thales measures 1.4 MB/s (Thales→VPS 20 MB/s): shipping the 27.5 GB store to Thales inside a window takes ~6 h. Trim must run on the VPS against History's digest list.
 4. Smaller: set WAL on the output, ANALYZE, refuse a hot -journal, assert max(id) kept, accept-trim through the stdio config, suspend the timer in the window.
+
+## Decision point (21 Oct 2026): trim stopped
+
+First-principles re-check with Claude Fable: the trim saves ~27% (about three weeks of growth at ~370 MB/day), needs a downtime window each time, and changes old threads' Worked receipts. Preservation is already met by the History copy plus R2. Trim work stops here. Sync cadence moved from hourly to daily 20:30 UTC (after the nightly backup) until something reads History.
+Payload by source (19 Oct copy, all time / last 30 d, GB): api_server 3.20/2.49, webui 3.61/0.00, subagent 2.28/1.13, telegram 1.49/0.04, cron 1.34/0.39; machine sources ≈33% of payload, ≈38% of recent. Next lever, pending owner approval: Hermes' own `sessions prune --source cron --older-than 30` after History verifies, then subagent once lineages are checked against visible threads.
