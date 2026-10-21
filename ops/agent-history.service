@@ -1,0 +1,11 @@
+[Unit]
+Description=Incremental Agent History copy (read-only source)
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/agent-history/environment
+ExecStart=/usr/bin/env python3 -m agent_history --config ${AGENT_HISTORY_CONFIG} sync
+Nice=19
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true

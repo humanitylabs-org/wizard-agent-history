@@ -1,0 +1,680 @@
+"""Version-one storage. Only this module knows the portable history schema."""
+from __future__ import annotations
+
+import base64
+import contextlib
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import time
+from compression import zstd
+from agent_history.fts_query import sanitize_fts5_query
+
+VERSION = 1
+BATCH = 400
+HUMAN_SOURCES = {'webui', 'api_server', 'telegram', 'cli'}
+PAYLOAD_FIELDS = ('reasoning', 'reasoning_content', 'reasoning_details',
+                  'codex_reasoning_items', 'codex_message_items', 'api_content', 'tool_calls')
+
+
+def json_default(x):
+    if isinstance(x, bytes):
+        return {'$bytes': base64.b64encode(x).decode('ascii')}
+    raise TypeError(type(x).__name__)
+
+
+def canonical(x):
+    return json.dumps(x, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+                      default=json_default).encode('utf-8')
+
+
+def unjson(data):
+    def hook(x):
+        if set(x) == {'$bytes'}:
+            return base64.b64decode(x['$bytes'])
+        return x
+    return json.loads(data, object_hook=hook)
+
+
+def strip_opaque(value, signature=False):
+    if isinstance(value, dict):
+        return {k: strip_opaque(v, signature) for k, v in value.items()
+                if k != 'encrypted_content' and not (signature and k == 'signature')}
+    if isinstance(value, list):
+        return [strip_opaque(x, signature) for x in value]
+    return value
+
+
+def sanitize(row):
+    row = dict(row)
+    for field in PAYLOAD_FIELDS:
+        if field == 'tool_calls':
+            continue  # Function arguments are owner data, not provider metadata.
+        value = row.get(field)
+        if isinstance(value, bytes) and field in ('codex_reasoning_items', 'reasoning_details', 'codex_message_items', 'api_content'):
+            try:
+                value = value.decode('utf-8')
+            except UnicodeDecodeError as e:
+                raise ValueError('opaque provider metadata is not UTF-8') from e
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            obj = json.loads(value)
+        except ValueError:
+            # Unknown opaque formats must fail closed, not leak an encrypted blob.
+            if field in ('codex_reasoning_items', 'reasoning_details', 'codex_message_items', 'api_content', 'tool_calls') and (
+                    'encrypted_content' in value or (field == 'reasoning_details' and '"signature"' in value)):
+                raise ValueError('unparseable provider metadata; manual format review required')
+            continue
+        cleaned = strip_opaque(obj, signature=field == 'reasoning_details')
+        if cleaned != obj or isinstance(row.get(field), bytes):
+            row[field] = canonical(cleaned).decode()
+    return row
+
+
+def row_hash(row):
+    # Flags are mutable visibility state, separately reconciled; all other columns
+    # (including IDs, UIDs and display identities) are bound to the content proof.
+    return hashlib.sha256(canonical({k: v for k, v in row.items()
+                                    if k not in ('active', 'compacted')})).hexdigest()
+
+
+def accumulate(proofs, row, digest):
+    sid = row['session_id']
+    count, h = proofs.setdefault(sid, [0, hashlib.sha256()])
+    proofs[sid][0] = count + 1
+    h.update(str(row['id']).encode() + b':' + digest.encode() + b'\n')
+
+
+def finished(proofs):
+    return {sid: {'count': count, 'sha256': h.hexdigest()} for sid, (count, h) in proofs.items()}
+
+
+def ro(path):
+    if isinstance(path, dict):
+        from .source_rpc import RemoteSource
+        return RemoteSource(path)
+    c = sqlite3.connect(Path(path).expanduser().resolve().as_uri() + '?mode=ro',
+                        uri=True, timeout=0.5, isolation_level=None)
+    c.row_factory = sqlite3.Row
+    c.execute('PRAGMA query_only=ON')
+    c.execute('PRAGMA busy_timeout=500')
+    return c
+
+
+def batches(c, columns='*', high=None):
+    """No yield with a live cursor: each fetch completes its short read snapshot."""
+    if high is None:
+        high = c.execute('SELECT coalesce(max(id),0) FROM messages').fetchone()[0]
+    last = 0
+    while last < high:
+        rows = c.execute(f'SELECT {columns} FROM messages WHERE id>? AND id<=? '
+                         'ORDER BY id LIMIT ?', (last, high, BATCH)).fetchall()
+        if not rows:
+            break
+        last = rows[-1]['id']
+        yield rows
+
+
+def metadata_batches(c, table, key):
+    if (table, key) not in (('sessions', 'id'), ('system_prompts', 'hash')):
+        raise ValueError('unsupported metadata relation')
+    last = None
+    first = True
+    while True:
+        rows = (c.execute(f'SELECT * FROM {table} ORDER BY {key} LIMIT ?', (BATCH,)) if first else
+                c.execute(f'SELECT * FROM {table} WHERE {key}>? ORDER BY {key} LIMIT ?', (last, BATCH))).fetchall()
+        if not rows:
+            break
+        first = False
+        last = rows[-1][key]
+        if last is None:
+            raise ValueError('null metadata key is unsupported')
+        yield rows
+
+
+def month_of(ts):
+    return datetime.fromtimestamp(float(ts), timezone.utc).strftime('%Y-%m')
+
+
+def open_month():
+    return month_of(time.time())
+
+
+def texts(row):
+    conv = (row.get('content') or '') if row['role'] in ('user', 'assistant') else ''
+    deep = '\n'.join(str(row.get(k) or '') for k in PAYLOAD_FIELDS)
+    if row['role'] == 'tool':
+        deep += '\n' + (row.get('content') or '')
+    deep += '\n' + (row.get('tool_name') or '')
+    return conv, deep
+
+
+def pack(row):
+    raw = canonical(row)
+    compressed = zstd.compress(raw, level=3) if len(raw) >= 512 else raw
+    return (compressed, 'zstd', len(raw)) if len(compressed) < len(raw) else (raw, 'raw', len(raw))
+
+
+def unpack(row):
+    return unjson(zstd.decompress(row['payload']) if row['codec'] == 'zstd' else row['payload'])
+
+
+CATALOG = '''
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,payload BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS system_prompts(hash TEXT PRIMARY KEY,prompt TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS months(month TEXT PRIMARY KEY,sealed INTEGER NOT NULL DEFAULT 0,
+ sha256 TEXT,verified_at REAL);
+CREATE TABLE IF NOT EXISTS inventory(id INTEGER PRIMARY KEY,month TEXT NOT NULL,
+ session_id TEXT NOT NULL,digest TEXT NOT NULL,active INTEGER,compacted INTEGER,
+ seen INTEGER NOT NULL,deleted INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS inventory_session ON inventory(session_id,id);
+CREATE TABLE IF NOT EXISTS proofs(session_id TEXT PRIMARY KEY,row_count INTEGER NOT NULL,
+ content_hash TEXT NOT NULL,verified_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS retired(id INTEGER PRIMARY KEY,expected_digest TEXT);
+CREATE TABLE IF NOT EXISTS released(session_id TEXT PRIMARY KEY,payload BLOB NOT NULL,
+ released_at REAL NOT NULL,row_count INTEGER NOT NULL);
+'''
+MONTH = '''
+CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL,
+ timestamp REAL NOT NULL,role TEXT NOT NULL,digest TEXT NOT NULL,
+ payload BLOB NOT NULL,codec TEXT NOT NULL,raw_bytes INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS session_rows ON messages(session_id,id);
+CREATE VIRTUAL TABLE IF NOT EXISTS conversation USING fts5(text,content='');
+CREATE VIRTUAL TABLE IF NOT EXISTS deep USING fts5(text,content='');
+'''
+
+
+class History:
+    """One trusted reader/source identity per instance. No cross-agent MCP grants."""
+    def __init__(self, root, agent='hermes', writable=True):
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', agent):
+            raise ValueError('invalid agent id')
+        self.agent = agent
+        self.dir = Path(root).expanduser().resolve() / agent
+        self.writable = writable
+        self.opened = {}
+        if writable:
+            self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.lockfile = open(self.dir / '.writer.lock', 'a')
+            import fcntl
+            fcntl.flock(self.lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.cat = sqlite3.connect(self.dir / 'catalog.db')
+            self.cat.row_factory = sqlite3.Row
+            self.cat.executescript(CATALOG)
+            version = self.get('version')
+            if version and int(version) != VERSION:
+                raise ValueError('unsupported catalog version')
+            self.set('version', VERSION)
+            self.cat.commit()
+        else:
+            self.cat = ro(self.dir / 'catalog.db')
+
+    def close(self):
+        for c in self.opened.values():
+            c.close()
+        self.cat.close()
+        if self.writable:
+            self.lockfile.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def get(self, key, default=None):
+        row = self.cat.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+        return row[0] if row else default
+
+    def set(self, key, value):
+        self.cat.execute('INSERT OR REPLACE INTO meta VALUES (?,?)', (key, str(value)))
+
+    def is_sealed(self, month):
+        r = self.cat.execute('SELECT sealed FROM months WHERE month=?', (month,)).fetchone()
+        return bool(r and r[0])
+
+    def db(self, month, write=False):
+        key = (month, write)
+        if key not in self.opened:
+            path = self.dir / (month + '.db')
+            if write:
+                if not self.writable or self.is_sealed(month):
+                    raise ValueError('sealed month is immutable')
+                c = sqlite3.connect(path)
+                c.row_factory = sqlite3.Row
+                c.executescript(MONTH)
+                self.cat.execute('INSERT OR IGNORE INTO months(month) VALUES (?)', (month,))
+            else:
+                c = ro(path)
+            self.opened[key] = c
+        return self.opened[key]
+
+    def stored(self, inv):
+        row = self.db(inv['month']).execute('SELECT * FROM messages WHERE id=?', (inv['id'],)).fetchone()
+        if row is None:
+            raise ValueError('history row missing')
+        data = unpack(row)
+        if row_hash(data) != inv['digest'] or row['digest'] != inv['digest']:
+            raise ValueError('history content hash mismatch')
+        data.update(active=inv['active'], compacted=inv['compacted'])
+        return data
+
+    def erase(self, inv):
+        if self.is_sealed(inv['month']):
+            # Logical deletion immediately hides sealed data. Physical deletion
+            # requires an explicit owner-approved reseal + encrypted-backup policy.
+            return
+        c = self.db(inv['month'], True)
+        old = c.execute('SELECT * FROM messages WHERE id=?', (inv['id'],)).fetchone()
+        if old:
+            for table, text in zip(('conversation', 'deep'), texts(unpack(old))):
+                c.execute(f'INSERT INTO {table}({table},rowid,text) VALUES (\'delete\',?,?)',
+                          (inv['id'], text))
+            c.execute('DELETE FROM messages WHERE id=?', (inv['id'],))
+
+    def put(self, row, generation):
+        row = sanitize(row)
+        digest = row_hash(row)
+        old = self.cat.execute('SELECT * FROM inventory WHERE id=?', (row['id'],)).fetchone()
+        retired = self.cat.execute('SELECT expected_digest FROM retired WHERE id=?', (row['id'],)).fetchone()
+        if retired:
+            if retired[0] != digest:
+                raise ValueError('retired row changed; explicit reconciliation required')
+            self.cat.execute('UPDATE inventory SET seen=?,active=?,compacted=? WHERE id=?',
+                             (generation, row.get('active', 1), row.get('compacted', 0), row['id']))
+            return False
+        month = month_of(row['timestamp'])
+        changed = not old or old['digest'] != digest or old['deleted']
+        if changed:
+            if self.is_sealed(month) or (old and self.is_sealed(old['month'])):
+                # Sealed files never change. A row that arrives late with an old
+                # timestamp, or a newer version of a sealed row, is kept in the
+                # open month; the sealed copy stays as the earlier version and
+                # inventory points at the current one.
+                month = open_month()
+            if old and old['month'] != month:
+                self.erase(old)
+            c = self.db(month, True)
+            # A previous crash may have committed payloads but not inventory.
+            # Delete by actual month-local bytes before replacing its FTS entries.
+            existing = c.execute('SELECT * FROM messages WHERE id=?', (row['id'],)).fetchone()
+            if existing:
+                for table, text in zip(('conversation', 'deep'), texts(unpack(existing))):
+                    c.execute(f"INSERT INTO {table}({table},rowid,text) VALUES ('delete',?,?)",
+                              (row['id'], text))
+            payload, codec, raw_bytes = pack(row)
+            c.execute('INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?,?)',
+                      (row['id'], row['session_id'], row['timestamp'], row['role'], digest,
+                       payload, codec, raw_bytes))
+            for table, text in zip(('conversation', 'deep'), texts(row)):
+                c.execute(f'INSERT INTO {table}(rowid,text) VALUES (?,?)', (row['id'], text))
+        self.cat.execute('INSERT OR REPLACE INTO inventory VALUES (?,?,?,?,?,?,?,0)',
+                         (row['id'], month, row['session_id'], digest, row.get('active', 1),
+                          row.get('compacted', 0), generation))
+        return changed
+
+    def commit(self):
+        # Payload before manifest: an interruption is retried idempotently using
+        # month-local stored bytes, never trusted solely from the watermark.
+        for (month, write), c in self.opened.items():
+            if write:
+                c.commit()
+        self.cat.commit()
+
+    def sync(self, source, reconcile=False):
+        start = time.monotonic()
+        with contextlib.closing(ro(source)) as src:
+            # Pin source identity to SQLite schema + explicit path; replacing the
+            # source is only admitted through accept-trim, not a guessed watermark.
+            from .source_rpc import descriptor, identity
+            source_path = descriptor(source)
+            if self.get('source') not in (None, source_path):
+                raise ValueError('catalog belongs to a different source')
+            self.set('source', source_path)
+            source_identity = identity(source, src)
+            if self.get('source_identity') not in (None, source_identity):
+                raise ValueError('source file replaced; explicit rebind required')
+            self.set('source_identity', source_identity)
+            generation = int(self.get('generation', 0)) + 1
+            self.set('generation', generation)
+            self.cat.commit()  # Never reuse a partially completed generation.
+            if src.execute('SELECT 1 FROM messages WHERE id<=0 LIMIT 1').fetchone():
+                raise ValueError('nonpositive Hermes message IDs are unsupported; nothing may be trimmed')
+            high = src.execute('SELECT coalesce(max(id),0) FROM messages').fetchone()[0]
+            watermark = int(self.get('watermark', 0))
+            self.cat.execute('DELETE FROM proofs')
+            self.cat.execute('DELETE FROM sessions')
+            # Metadata is small and is refreshed even when there are no new messages.
+            for metadata in metadata_batches(src, 'sessions', 'id'):
+                for s in metadata:
+                    self.cat.execute('INSERT INTO sessions VALUES (?,?)', (s['id'], canonical(dict(s))))
+            if src.execute("SELECT 1 FROM sqlite_master WHERE name='system_prompts'").fetchone():
+                for metadata in metadata_batches(src, 'system_prompts', 'hash'):
+                    for p in metadata:
+                        self.cat.execute('INSERT OR REPLACE INTO system_prompts VALUES (?,?)', (p['hash'], p['prompt']))
+            changed = scanned = 0
+            # Every pass scans IDs/flags only on old rows. A full payload pass is
+            # mandatory before sealing and verification; no long live read txn.
+            for batch in batches(src, 'id,active,compacted', high):
+                ids = [r['id'] for r in batch]
+                wanted = ids if reconcile else [i for i in ids if i > watermark]
+                if wanted and not reconcile:
+                    # Resume an interrupted pass without re-reading copied payloads.
+                    marks = ','.join('?' for _ in wanted)
+                    have = {r[0] for r in self.cat.execute(
+                        f'SELECT id FROM inventory WHERE deleted=0 AND id IN ({marks})', wanted)}
+                    wanted = [i for i in wanted if i not in have]
+                loaded = set()
+                if wanted:
+                    marks = ','.join('?' for _ in wanted)
+                    full = src.execute(f'SELECT * FROM messages WHERE id IN ({marks}) ORDER BY id', wanted).fetchall()
+                    for row in full:
+                        changed += self.put(row, generation)
+                        loaded.add(row['id'])
+                self.cat.executemany('UPDATE inventory SET active=?,compacted=?,seen=? WHERE id=?',
+                                     [(r['active'], r['compacted'], generation, r['id']) for r in batch if r['id'] not in loaded])
+                scanned += len(batch)
+                self.commit()
+            # Sessions released to History (pruned from the live store after
+            # History verified them) stay here: their absence is expected.
+            self.cat.execute('INSERT OR IGNORE INTO retired SELECT id, NULL FROM inventory '
+                             'WHERE seen<>? AND deleted=0 AND id<=? '
+                             'AND session_id IN (SELECT session_id FROM released)',
+                             (generation, max(high, watermark)))
+            self.commit()
+            # Missing rows are owner deletions, except an accepted trim or release.
+            last = 0
+            deleted = 0
+            while True:
+                missing = self.cat.execute('SELECT * FROM inventory WHERE id>? AND id<=? AND seen<>? '
+                    'AND deleted=0 AND session_id NOT IN (SELECT session_id FROM released) '
+                    'AND (id NOT IN (SELECT id FROM retired WHERE expected_digest IS NULL) '
+                    'OR session_id NOT IN (SELECT id FROM sessions)) ORDER BY id LIMIT ?',
+                    (last, max(high, watermark), generation, BATCH)).fetchall()
+                if not missing:
+                    break
+                for inv in missing:
+                    self.erase(inv)
+                    self.cat.execute('UPDATE inventory SET deleted=1 WHERE id=?', (inv['id'],))
+                    deleted += 1
+                last = missing[-1]['id']
+                self.commit()
+            self.set('watermark', max(high, watermark))
+            self.set('generation', generation)
+            self.set('reconciled', int(reconcile))
+            self.commit()
+        exported = self.export()
+        return dict(scanned=scanned, changed=changed, deleted=deleted, conversation=exported,
+                    seconds=round(time.monotonic() - start, 3))
+
+    def verify(self, source):
+        start = time.monotonic()
+        proofs = {}
+        self.cat.execute('DELETE FROM proofs')
+        self.cat.commit()
+        from .source_rpc import source_token
+        with contextlib.closing(ro(source)) as src:
+            before = source_token(source, src)
+            for batch in batches(src):
+                for raw in batch:
+                    row = sanitize(raw)
+                    inv = self.cat.execute('SELECT * FROM inventory WHERE id=? AND deleted=0', (row['id'],)).fetchone()
+                    if inv is None:
+                        raise ValueError('source row has no History copy')
+                    saved = self.stored(inv)
+                    retired = self.cat.execute('SELECT expected_digest FROM retired WHERE id=?', (row['id'],)).fetchone()
+                    expected = retired[0] if retired else inv['digest']
+                    if row_hash(row) != expected:
+                        raise ValueError('source content differs from History')
+                    if (row['active'], row['compacted']) != (saved['active'], saved['compacted']):
+                        raise ValueError('source flags changed; sync again')
+                    accumulate(proofs, row, row_hash(row))
+            count = sum(p[0] for p in proofs.values())
+            if count != src.execute('SELECT count(*) FROM messages').fetchone()[0]:
+                raise ValueError('source count changed or an unsupported ID was skipped')
+            expected = self.cat.execute('SELECT count(*) FROM inventory WHERE deleted=0 '
+                       'AND id NOT IN (SELECT id FROM retired WHERE expected_digest IS NULL)').fetchone()[0]
+            if count != expected:
+                raise ValueError('row count mismatch; reconcile deletions before verification')
+            if source_token(source, src) != before:
+                raise ValueError('source changed during verification; quiesce it and retry')
+        result = finished(proofs)
+        self.cat.execute('DELETE FROM proofs')
+        self.cat.executemany('INSERT INTO proofs VALUES (?,?,?,?)',
+                             [(sid, p['count'], p['sha256'], time.time()) for sid, p in result.items()])
+        self.cat.commit()
+        return dict(rows=count, sessions=len(result), seconds=round(time.monotonic() - start, 3))
+
+    def seal(self, source, month):
+        if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', month) or month >= month_of(time.time()):
+            raise ValueError('only past calendar months can be sealed')
+        if self.is_sealed(month):
+            return {'month': month, 'already_sealed': True}
+        # Sealing is a quiescent-source operation. Hold a reader connection, not
+        # a long read transaction, and reject any observed concurrent commit.
+        from .source_rpc import identity
+        with contextlib.closing(ro(source)) as monitor:
+            def token():
+                if isinstance(source, dict):
+                    info = monitor.rpc({'method': 'info'})
+                    return info['identity'], info['data_version']
+                return identity(source), monitor.execute('PRAGMA data_version').fetchone()[0]
+            before = token()
+            self.sync(source, reconcile=True)
+            self.verify(source)
+            c = self.db(month, True)
+            c.execute("INSERT INTO conversation(conversation) VALUES ('integrity-check')")
+            c.execute("INSERT INTO deep(deep) VALUES ('integrity-check')")
+            c.commit()
+            c.execute('VACUUM')
+            if c.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise ValueError('month integrity failed')
+            c.close()
+            del self.opened[(month, True)]
+            digest = file_hash(self.dir / (month + '.db'))
+            if token() != before:
+                raise ValueError('source changed during sealing; quiesce it and retry')
+            self.cat.execute('UPDATE months SET sealed=1,sha256=?,verified_at=? WHERE month=?',
+                             (digest, time.time(), month))
+            self.cat.commit()
+        return {'month': month, 'sha256': digest}
+
+    def search(self, query, deep=False, after=None, before=None, limit=20):
+        if not isinstance(query, str) or not query.strip():
+            return []
+        limit = max(1, min(int(limit), 1000))
+        after, before = bound(after), bound(before)
+        # Accept the same query text agents send to Hermes session_search.
+        query = sanitize_fts5_query(query)
+        if not query:
+            return []
+        hits = []
+        for m in self.cat.execute('SELECT month FROM months ORDER BY month DESC').fetchall():
+            month = m[0]
+            c = self.db(month)
+            ids = set()
+            # Match query is FTS5 syntax, not SQL. Parameterization is mandatory.
+            for table in (('conversation', 'deep') if deep else ('conversation',)):
+                try:
+                    ids.update(r[0] for r in c.execute(
+                        f'SELECT rowid FROM {table} WHERE {table} MATCH ?', (query,)).fetchall())
+                except sqlite3.OperationalError as e:
+                    raise ValueError('invalid FTS query') from e
+            # Collapse to one newest message per session, globally after all months.
+            for id in ids:
+                inv = self.cat.execute('SELECT * FROM inventory WHERE id=? AND deleted=0 '
+                                       'AND (active=1 OR compacted=1)', (id,)).fetchone()
+                if inv is None or inv['month'] != month:
+                    continue  # Hidden, deleted, or an earlier version kept in a sealed month.
+                r = c.execute('SELECT timestamp,session_id FROM messages WHERE id=?', (id,)).fetchone()
+                if after is not None and r['timestamp'] < after:
+                    continue
+                if before is not None and r['timestamp'] >= before:
+                    continue
+                hits.append((r['timestamp'], id, month, r['session_id']))
+        result, seen = [], set()
+        for ts, id, month, sid in sorted(hits, reverse=True):
+            if sid in seen:
+                continue
+            seen.add(sid)
+            inv = self.cat.execute('SELECT * FROM inventory WHERE id=?', (id,)).fetchone()
+            row = self.stored(inv)
+            meta = self.session_meta(sid) or {}
+            text = '\n'.join(texts(row)) if deep else texts(row)[0]
+            # Snippet generation has no second uncompressed canonical text copy.
+            needle = re.sub(r'[^\w ]', '', query).split()
+            pos = next((text.lower().find(n.lower()) for n in needle if n.lower() in text.lower()), 0)
+            result.append(dict(agent=self.agent, month=month, session_id=sid,
+                title=meta.get('title'), message_id=id, timestamp=ts,
+                snippet=text[max(0, pos - 100):max(0, pos - 100) + 600]))
+            if len(result) >= limit:
+                break
+        return result
+
+    def session_meta(self, session_id):
+        for sql in ('SELECT payload FROM sessions WHERE id=?', 'SELECT payload FROM released WHERE session_id=?'):
+            r = self.cat.execute(sql, (session_id,)).fetchone()
+            if r:
+                return unjson(r[0])
+        return None
+
+    def release(self, source, session_ids):
+        """Record that History keeps these sessions after the live store prunes them.
+
+        Every row of each session must already be in History with the same
+        digest; otherwise nothing is released. Run before `hermes sessions prune`.
+        """
+        session_ids = sorted(set(session_ids))
+        done = {r[0]: r[1] for r in self.cat.execute('SELECT session_id, row_count FROM released')}
+        staged, total, count = [], 0, 0
+        with contextlib.closing(ro(source)) as src:
+            for sid in session_ids:
+                if sid in done:  # Resumable: an earlier run already verified this session.
+                    total += done[sid]
+                    count += 1
+                    continue
+                meta = src.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+                if meta is None:
+                    raise ValueError(f'{sid}: not in the source; nothing released')
+                rows = src.execute('SELECT * FROM messages WHERE session_id=? ORDER BY id', (sid,)).fetchall()
+                for raw in rows:
+                    row = sanitize(raw)
+                    inv = self.cat.execute('SELECT digest FROM inventory WHERE id=? AND deleted=0',
+                                           (row['id'],)).fetchone()
+                    if inv is None or inv[0] != row_hash(row):
+                        raise ValueError(f'{sid}: History copy is missing or stale; sync first, nothing released')
+                staged.append((sid, canonical(dict(meta)), time.time(), len(rows)))
+                if len(staged) >= 50:
+                    self.cat.executemany('INSERT OR REPLACE INTO released VALUES (?,?,?,?)', staged)
+                    self.commit()
+                    count += len(staged)
+                    total += sum(r[3] for r in staged)
+                    staged = []
+        self.cat.executemany('INSERT OR REPLACE INTO released VALUES (?,?,?,?)', staged)
+        self.commit()
+        return dict(released=count + len(staged), rows=total + sum(r[3] for r in staged))
+
+    def read(self, session_id, after_id=0, limit=100):
+        limit = max(1, min(int(limit), 500))
+        invs = self.cat.execute('SELECT * FROM inventory WHERE session_id=? AND id>? AND deleted=0 '
+                               'ORDER BY id LIMIT ?', (session_id, int(after_id), limit + 1)).fetchall()
+        rows = []
+        for inv in invs[:limit]:
+            row = self.stored(inv)
+            rows.append(dict(agent=self.agent, month=inv['month'], **row))
+        return {'session': self.session_meta(session_id),
+                'messages': rows, 'has_more': len(invs) > limit,
+                'next_after_id': rows[-1]['id'] if rows else after_id}
+
+    def export(self, output=None):
+        output = Path(output) if output else self.dir / 'conversation.jsonl'
+        temp = output.with_name(output.name + '.partial')
+        if temp.exists() or temp.is_symlink():
+            if output == self.dir / 'conversation.jsonl' and temp.is_file() and not temp.is_symlink():
+                temp.unlink()  # Exclusive History writer lock owns this derived artifact.
+            else:
+                raise ValueError('export partial exists outside the owned default export')
+        count, seen = 0, set()
+        sources = {r[0]: unjson(r[1]).get('source') for r in self.cat.execute(
+            'SELECT session_id, payload FROM released UNION ALL SELECT id, payload FROM sessions')}
+        with open(temp, 'xb') as f:
+            for month, in self.cat.execute('SELECT month FROM months ORDER BY month').fetchall():
+                c = self.db(month)
+                last = 0
+                while True:
+                    rows = c.execute("SELECT * FROM messages WHERE id>? AND role IN ('user','assistant') ORDER BY id LIMIT ?",
+                                     (last, BATCH)).fetchall()
+                    if not rows:
+                        break
+                    last = rows[-1]['id']
+                    for stored in rows:
+                        inv = self.cat.execute('SELECT * FROM inventory WHERE id=? AND deleted=0 '
+                                               'AND (active=1 OR compacted=1)', (stored['id'],)).fetchone()
+                        if not inv or inv['month'] != month:
+                            continue
+                        if sources.get(stored['session_id']) not in HUMAN_SOURCES:
+                            continue
+                        row = unpack(stored)
+                        text = row.get('content')
+                        if not text or row.get('_compressed_summary') or text.lstrip().startswith(('[CONTEXT COMPACTION', '[CONTEXT SUMMARY]:')):
+                            continue
+                        if row.get('display_kind') in ('internal', 'machine', 'system', 'hidden'):
+                            continue
+                        try:
+                            display_meta = json.loads(row.get('display_metadata') or '{}')
+                        except ValueError:
+                            display_meta = {}
+                        if isinstance(display_meta, dict) and display_meta.get('model_only'):
+                            continue
+                        if row['role'] == 'assistant' and row.get('tool_calls') not in (None, '', '[]', 'null'):
+                            continue
+                        identity = row.get('message_uid') or row.get('display_identity') or hashlib.sha256(
+                            canonical([row['role'], row['timestamp'], text])).hexdigest()
+                        key = (row['session_id'], identity)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        f.write(canonical(dict(agent=self.agent, month=month, session_id=row['session_id'],
+                            message_id=row['id'], timestamp=row['timestamp'], role=row['role'], content=text)) + b'\n')
+                        count += 1
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, output)
+        return {'rows': count, 'bytes': output.stat().st_size}
+
+    def stats(self):
+        months = []
+        for m in self.cat.execute('SELECT * FROM months ORDER BY month').fetchall():
+            c = self.db(m['month'])
+            row = c.execute('SELECT count(*),coalesce(sum(raw_bytes),0),coalesce(sum(length(payload)),0) FROM messages').fetchone()
+            months.append(dict(month=m['month'], sealed=bool(m['sealed']), rows=row[0],
+                               raw_bytes=row[1], payload_bytes=row[2], bytes=(self.dir / (m['month'] + '.db')).stat().st_size))
+        return dict(months=months, rows=sum(m['rows'] for m in months),
+                    sessions=self.cat.execute('SELECT count(*) FROM sessions').fetchone()[0],
+                    released=self.cat.execute('SELECT count(*) FROM released').fetchone()[0],
+                    total_bytes=sum(p.stat().st_size for p in self.dir.iterdir() if p.is_file()))
+
+
+def bound(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()

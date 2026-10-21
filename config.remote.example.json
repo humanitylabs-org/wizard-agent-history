@@ -1,0 +1,11 @@
+{
+  "root": "/external-volume/agent-history",
+  "agent": "hermes",
+  "live_days": 30,
+  "source": {
+    "ssh": "source-host-alias",
+    "repo": "/path/to/wizard-agent-history",
+    "python": "/path/to/python3.14",
+    "path": "/path/to/live/state.db"
+  }
+}
