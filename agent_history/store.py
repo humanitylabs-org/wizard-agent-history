@@ -551,9 +551,14 @@ class History:
         digest; otherwise nothing is released. Run before `hermes sessions prune`.
         """
         session_ids = sorted(set(session_ids))
-        staged = []
+        done = {r[0]: r[1] for r in self.cat.execute('SELECT session_id, row_count FROM released')}
+        staged, total, count = [], 0, 0
         with contextlib.closing(ro(source)) as src:
             for sid in session_ids:
+                if sid in done:  # Resumable: an earlier run already verified this session.
+                    total += done[sid]
+                    count += 1
+                    continue
                 meta = src.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
                 if meta is None:
                     raise ValueError(f'{sid}: not in the source; nothing released')
@@ -565,9 +570,15 @@ class History:
                     if inv is None or inv[0] != row_hash(row):
                         raise ValueError(f'{sid}: History copy is missing or stale; sync first, nothing released')
                 staged.append((sid, canonical(dict(meta)), time.time(), len(rows)))
+                if len(staged) >= 50:
+                    self.cat.executemany('INSERT OR REPLACE INTO released VALUES (?,?,?,?)', staged)
+                    self.commit()
+                    count += len(staged)
+                    total += sum(r[3] for r in staged)
+                    staged = []
         self.cat.executemany('INSERT OR REPLACE INTO released VALUES (?,?,?,?)', staged)
         self.commit()
-        return dict(released=len(staged), rows=sum(r[3] for r in staged))
+        return dict(released=count + len(staged), rows=total + sum(r[3] for r in staged))
 
     def read(self, session_id, after_id=0, limit=100):
         limit = max(1, min(int(limit), 500))
