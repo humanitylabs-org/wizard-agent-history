@@ -64,3 +64,15 @@ are closed. The live Hermes store remains untouched.
   - 56 timeouts under a shared 60 s cap: 42 on the original store; 14 attributed to the trimmed store only because the original consumed 37–47 s of the cap first. Re-run alone, all 14 finish on the trimmed store in 0.4–27 s.
 - Defect fixed: History search rejected Hermes query syntax (`OR`, quotes, `:`), raising "invalid FTS query". It now uses Hermes' sanitizer (vendored, MIT); regression test added (35 tests pass on VPS and Thales).
 - Size: 27.5 GB → 20.2 GB on the copy (−27%), because every active row and all visible prose stay at every age.
+
+## Hourly copy live (21 Oct 2026, a26e4eb)
+
+- `agent-history-sync.timer` on the VPS runs hourly; the VPS dials Thales (`ops/bridge.py`), Thales needs no route back. Source reader runs at nice 19 / idle I/O, unit MemoryHigh=2G. First catch-up 885 s; 3,144,247 rows held.
+- Fixed: a row inserted 21 Oct carrying a 30 Sept timestamp stopped the first run ("late insert in sealed month"). Late arrivals and newer versions of sealed rows now go to the open month; sealed files never change (September hash re-checked). No reseal needed.
+
+## Independent trim review (Claude Fable, 21 Oct): SHIP WITH FIXES — trim not scheduled
+
+1. Old compacted tool rows feed the Chats "Worked" receipt (step timing, plan, questions). Dropping them changes old threads. Old inactive rows measured on the 19 Oct copy: compacted tool rows 1,066,841 / 3.67 GB content; rewind tool rows 23,676 / 64 MB; compacted assistant reasoning 1.50 GB. Fix: keep every compacted tool row, shorten only its content, and prove the receipt is unchanged.
+2. 1,942,338 visible rows (6,143 sessions) have no display identity yet; Hermes fills them on first view. Verify/trim must treat display_order/display_identity as display state, not content, or the window's verify fails closed.
+3. VPS→Thales measures 1.4 MB/s (Thales→VPS 20 MB/s): shipping the 27.5 GB store to Thales inside a window takes ~6 h. Trim must run on the VPS against History's digest list.
+4. Smaller: set WAL on the output, ANALYZE, refuse a hot -journal, assert max(id) kept, accept-trim through the stdio config, suspend the timer in the window.
