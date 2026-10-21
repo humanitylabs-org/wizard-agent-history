@@ -225,14 +225,24 @@ class HistoryTests(unittest.TestCase):
                 self.h.seal(self.source, '2020-01')
         self.assertFalse(self.h.is_sealed('2020-01'))
 
-    def test_refuse_sealed_late_edit(self):
+    def test_sealed_late_edit_and_late_arrival_go_to_open_month(self):
+        # Hermes backfills display identities on old rows and can insert rows
+        # carrying an old timestamp. Sealed bytes stay fixed; the current
+        # version lives in the open month and is the one search and export use.
         self.add()
         self.sync()
-        self.h.seal(self.source, '2020-01')
-        self.conn.execute("UPDATE messages SET content='Synthetic changed'")
+        digest = self.h.seal(self.source, '2020-01')['sha256']
+        self.conn.execute("UPDATE messages SET content='Synthetic changed marigold', display_order=7")
         self.conn.commit()
-        with self.assertRaises(ValueError):
-            self.h.sync(self.source, reconcile=True)
+        self.add(content='Synthetic late lilac')  # new id, January 2020 timestamp
+        self.h.sync(self.source, reconcile=True)
+        self.assertEqual(file_hash(self.h.dir / '2020-01.db'), digest)
+        self.assertEqual(self.h.search('violet'), [])
+        self.assertEqual([r['month'] for r in self.h.search('marigold')], [month_of(time.time())])
+        self.assertEqual([r['month'] for r in self.h.search('lilac')], [month_of(time.time())])
+        self.assertEqual(self.h.read('a')['messages'][0]['content'], 'Synthetic changed marigold')
+        self.assertEqual(self.h.verify(self.source)['rows'], 2)
+        self.assertEqual(self.h.export()['rows'], 2)
 
     def test_export_human_final_only_and_dedupe(self):
         self.add(message_uid='synthetic-user', _compressed_summary=0)

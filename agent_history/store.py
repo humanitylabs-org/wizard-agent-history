@@ -141,6 +141,10 @@ def month_of(ts):
     return datetime.fromtimestamp(float(ts), timezone.utc).strftime('%Y-%m')
 
 
+def open_month():
+    return month_of(time.time())
+
+
 def texts(row):
     conv = (row.get('content') or '') if row['role'] in ('user', 'assistant') else ''
     deep = '\n'.join(str(row.get(k) or '') for k in PAYLOAD_FIELDS)
@@ -287,7 +291,11 @@ class History:
         changed = not old or old['digest'] != digest or old['deleted']
         if changed:
             if self.is_sealed(month) or (old and self.is_sealed(old['month'])):
-                raise ValueError('late insert/edit in sealed month; explicit reseal required')
+                # Sealed files never change. A row that arrives late with an old
+                # timestamp, or a newer version of a sealed row, is kept in the
+                # open month; the sealed copy stays as the earlier version and
+                # inventory points at the current one.
+                month = open_month()
             if old and old['month'] != month:
                 self.erase(old)
             c = self.db(month, True)
@@ -492,8 +500,8 @@ class History:
             for id in ids:
                 inv = self.cat.execute('SELECT * FROM inventory WHERE id=? AND deleted=0 '
                                        'AND (active=1 OR compacted=1)', (id,)).fetchone()
-                if inv is None:
-                    continue
+                if inv is None or inv['month'] != month:
+                    continue  # Hidden, deleted, or an earlier version kept in a sealed month.
                 r = c.execute('SELECT timestamp,session_id FROM messages WHERE id=?', (id,)).fetchone()
                 if after is not None and r['timestamp'] < after:
                     continue
@@ -556,7 +564,7 @@ class History:
                     for stored in rows:
                         inv = self.cat.execute('SELECT * FROM inventory WHERE id=? AND deleted=0 '
                                                'AND (active=1 OR compacted=1)', (stored['id'],)).fetchone()
-                        if not inv:
+                        if not inv or inv['month'] != month:
                             continue
                         if sources.get(stored['session_id']) not in HUMAN_SOURCES:
                             continue

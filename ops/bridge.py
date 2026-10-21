@@ -25,12 +25,14 @@ def main(argv=None):
         p.error('remote command required after --')
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = dict(os.environ, PYTHONPATH=here)
-    server = subprocess.Popen([a.python, '-m', 'agent_history', 'source-serve', '--source', a.source],
+    # Lowest CPU and I/O priority: the source is a live store serving the app.
+    low = ['nice', '-n', '19'] + (['ionice', '-c', '3'] if os.path.exists('/usr/bin/ionice') else [])
+    server = subprocess.Popen(low + [a.python, '-m', 'agent_history', 'source-serve', '--source', a.source],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
     try:
         client = subprocess.Popen(remote, stdin=server.stdout, stdout=server.stdin)
-        server.stdout.close()
-        server.stdin.close()
+        server.stdout.close()  # type: ignore[union-attr]
+        server.stdin.close()  # type: ignore[union-attr]
         code = client.wait()
     finally:
         if server.poll() is None:
