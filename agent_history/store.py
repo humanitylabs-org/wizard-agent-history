@@ -177,6 +177,8 @@ CREATE INDEX IF NOT EXISTS inventory_session ON inventory(session_id,id);
 CREATE TABLE IF NOT EXISTS proofs(session_id TEXT PRIMARY KEY,row_count INTEGER NOT NULL,
  content_hash TEXT NOT NULL,verified_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS retired(id INTEGER PRIMARY KEY,expected_digest TEXT);
+CREATE TABLE IF NOT EXISTS released(session_id TEXT PRIMARY KEY,payload BLOB NOT NULL,
+ released_at REAL NOT NULL,row_count INTEGER NOT NULL);
 '''
 MONTH = '''
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL,
@@ -379,12 +381,20 @@ class History:
                                      [(r['active'], r['compacted'], generation, r['id']) for r in batch if r['id'] not in loaded])
                 scanned += len(batch)
                 self.commit()
-            # Missing rows are owner deletions, except an explicitly accepted trim.
+            # Sessions released to History (pruned from the live store after
+            # History verified them) stay here: their absence is expected.
+            self.cat.execute('INSERT OR IGNORE INTO retired SELECT id, NULL FROM inventory '
+                             'WHERE seen<>? AND deleted=0 AND id<=? '
+                             'AND session_id IN (SELECT session_id FROM released)',
+                             (generation, max(high, watermark)))
+            self.commit()
+            # Missing rows are owner deletions, except an accepted trim or release.
             last = 0
             deleted = 0
             while True:
                 missing = self.cat.execute('SELECT * FROM inventory WHERE id>? AND id<=? AND seen<>? '
-                    'AND deleted=0 AND (id NOT IN (SELECT id FROM retired WHERE expected_digest IS NULL) '
+                    'AND deleted=0 AND session_id NOT IN (SELECT session_id FROM released) '
+                    'AND (id NOT IN (SELECT id FROM retired WHERE expected_digest IS NULL) '
                     'OR session_id NOT IN (SELECT id FROM sessions)) ORDER BY id LIMIT ?',
                     (last, max(high, watermark), generation, BATCH)).fetchall()
                 if not missing:
@@ -515,8 +525,7 @@ class History:
             seen.add(sid)
             inv = self.cat.execute('SELECT * FROM inventory WHERE id=?', (id,)).fetchone()
             row = self.stored(inv)
-            s = self.cat.execute('SELECT payload FROM sessions WHERE id=?', (sid,)).fetchone()
-            meta = unjson(s[0]) if s else {}
+            meta = self.session_meta(sid) or {}
             text = '\n'.join(texts(row)) if deep else texts(row)[0]
             # Snippet generation has no second uncompressed canonical text copy.
             needle = re.sub(r'[^\w ]', '', query).split()
@@ -528,6 +537,38 @@ class History:
                 break
         return result
 
+    def session_meta(self, session_id):
+        for sql in ('SELECT payload FROM sessions WHERE id=?', 'SELECT payload FROM released WHERE session_id=?'):
+            r = self.cat.execute(sql, (session_id,)).fetchone()
+            if r:
+                return unjson(r[0])
+        return None
+
+    def release(self, source, session_ids):
+        """Record that History keeps these sessions after the live store prunes them.
+
+        Every row of each session must already be in History with the same
+        digest; otherwise nothing is released. Run before `hermes sessions prune`.
+        """
+        session_ids = sorted(set(session_ids))
+        staged = []
+        with contextlib.closing(ro(source)) as src:
+            for sid in session_ids:
+                meta = src.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+                if meta is None:
+                    raise ValueError(f'{sid}: not in the source; nothing released')
+                rows = src.execute('SELECT * FROM messages WHERE session_id=? ORDER BY id', (sid,)).fetchall()
+                for raw in rows:
+                    row = sanitize(raw)
+                    inv = self.cat.execute('SELECT digest FROM inventory WHERE id=? AND deleted=0',
+                                           (row['id'],)).fetchone()
+                    if inv is None or inv[0] != row_hash(row):
+                        raise ValueError(f'{sid}: History copy is missing or stale; sync first, nothing released')
+                staged.append((sid, canonical(dict(meta)), time.time(), len(rows)))
+        self.cat.executemany('INSERT OR REPLACE INTO released VALUES (?,?,?,?)', staged)
+        self.commit()
+        return dict(released=len(staged), rows=sum(r[3] for r in staged))
+
     def read(self, session_id, after_id=0, limit=100):
         limit = max(1, min(int(limit), 500))
         invs = self.cat.execute('SELECT * FROM inventory WHERE session_id=? AND id>? AND deleted=0 '
@@ -536,8 +577,7 @@ class History:
         for inv in invs[:limit]:
             row = self.stored(inv)
             rows.append(dict(agent=self.agent, month=inv['month'], **row))
-        session = self.cat.execute('SELECT payload FROM sessions WHERE id=?', (session_id,)).fetchone()
-        return {'session': unjson(session[0]) if session else None,
+        return {'session': self.session_meta(session_id),
                 'messages': rows, 'has_more': len(invs) > limit,
                 'next_after_id': rows[-1]['id'] if rows else after_id}
 
@@ -550,7 +590,8 @@ class History:
             else:
                 raise ValueError('export partial exists outside the owned default export')
         count, seen = 0, set()
-        sources = {r['id']: unjson(r['payload']).get('source') for r in self.cat.execute('SELECT * FROM sessions')}
+        sources = {r[0]: unjson(r[1]).get('source') for r in self.cat.execute(
+            'SELECT session_id, payload FROM released UNION ALL SELECT id, payload FROM sessions')}
         with open(temp, 'xb') as f:
             for month, in self.cat.execute('SELECT month FROM months ORDER BY month').fetchall():
                 c = self.db(month)
@@ -605,6 +646,7 @@ class History:
                                raw_bytes=row[1], payload_bytes=row[2], bytes=(self.dir / (m['month'] + '.db')).stat().st_size))
         return dict(months=months, rows=sum(m['rows'] for m in months),
                     sessions=self.cat.execute('SELECT count(*) FROM sessions').fetchone()[0],
+                    released=self.cat.execute('SELECT count(*) FROM released').fetchone()[0],
                     total_bytes=sum(p.stat().st_size for p in self.dir.iterdir() if p.is_file()))
 
 

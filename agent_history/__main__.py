@@ -59,13 +59,15 @@ def main(argv=None):
     sub = p.add_subparsers(dest='cmd', required=True)
     source_server = sub.add_parser('source-serve')
     source_server.add_argument('--source', required=True)
-    for name in ('sync', 'verify', 'seal', 'trim-copy', 'accept-trim'):
+    for name in ('sync', 'verify', 'seal', 'trim-copy', 'accept-trim', 'release'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--source')
         if name == 'sync':
             cmd.add_argument('--reconcile', action='store_true')
         if name == 'seal':
             cmd.add_argument('month')
+        if name == 'release':
+            cmd.add_argument('--sessions-file', required=True, help='one session ID per line')
         if name == 'trim-copy':
             cmd.add_argument('--output', required=True)
             cmd.add_argument('--live-days', type=int)
@@ -103,7 +105,7 @@ def main(argv=None):
     if not root:
         p.error('--root or config.root is required (no implicit live paths)')
     source = getattr(args, 'source', None) or cfg.get('source')
-    if args.cmd in ('sync', 'verify', 'seal', 'trim-copy', 'accept-trim') and not source:
+    if args.cmd in ('sync', 'verify', 'seal', 'trim-copy', 'accept-trim', 'release') and not source:
         p.error('--source or config.source is required')
     writable = args.cmd not in ('search', 'read', 'stats', 'mcp')
     with History(root, args.agent or cfg.get('agent', 'hermes'), writable=writable) as h:
@@ -115,6 +117,9 @@ def main(argv=None):
             result = h.seal(source, args.month)
         elif args.cmd == 'trim-copy':
             result = trim_copy(h, source, args.output, args.live_days or cfg.get('live_days', 30))
+        elif args.cmd == 'release':
+            ids = [line.strip() for line in open(args.sessions_file) if line.strip()]
+            result = h.release(source, ids)
         elif args.cmd == 'accept-trim':
             result = accept_trim(h, source, args.ledger)
         elif args.cmd == 'search':

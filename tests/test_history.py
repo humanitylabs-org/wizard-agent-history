@@ -138,6 +138,39 @@ class HistoryTests(unittest.TestCase):
         self.assertNotIn('violet', (self.h.dir / 'conversation.jsonl').read_text())
         self.assertEqual(self.h.db('2020-01').execute('SELECT count(*) FROM messages').fetchone()[0], 0)
 
+    def test_released_session_survives_live_prune(self):
+        # Hermes `sessions prune` removes the whole session from the live store
+        # after History released it; History keeps rows, metadata and search.
+        self.add(session_id='b', content='Synthetic cron marigold')
+        self.add(session_id='b', role='tool', content='Synthetic tool output')
+        self.add(content='Synthetic deleted violet')  # session a: real owner delete
+        self.sync()
+        with self.assertRaises(ValueError):
+            self.h.release(self.source, ['missing'])
+        self.assertEqual(self.h.release(self.source, ['b']), dict(released=1, rows=2))
+        self.conn.execute("DELETE FROM messages")
+        self.conn.execute("DELETE FROM sessions WHERE id='b'")
+        self.conn.commit()
+        result = self.h.sync(self.source, reconcile=True)
+        self.assertEqual(result['deleted'], 1)  # only the session-a owner deletion
+        self.assertEqual(self.h.search('violet'), [])
+        hit = self.h.search('marigold')
+        self.assertEqual([(r['session_id'], r['title']) for r in hit], [('b', 'Synthetic helper')])
+        read = self.h.read('b')
+        self.assertEqual(read['session']['source'], 'subagent')
+        self.assertEqual(len(read['messages']), 2)
+        self.assertEqual(self.h.verify(self.source)['rows'], 0)
+        self.assertEqual(self.h.stats()['released'], 1)
+        self.assertEqual(self.h.sync(self.source, reconcile=True)['deleted'], 0)
+
+    def test_release_refuses_stale_copy(self):
+        self.add(session_id='b', content='Synthetic cron marigold')
+        self.sync()
+        self.add(session_id='b', content='Synthetic not yet copied')
+        with self.assertRaises(ValueError):
+            self.h.release(self.source, ['b'])
+        self.assertEqual(self.h.stats()['released'], 0)
+
     def test_edits_full_reconciliation(self):
         i = self.add()
         self.sync()
