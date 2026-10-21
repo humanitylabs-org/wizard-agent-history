@@ -354,6 +354,12 @@ class History:
             for batch in batches(src, 'id,active,compacted', high):
                 ids = [r['id'] for r in batch]
                 wanted = ids if reconcile else [i for i in ids if i > watermark]
+                if wanted and not reconcile:
+                    # Resume an interrupted pass without re-reading copied payloads.
+                    marks = ','.join('?' for _ in wanted)
+                    have = {r[0] for r in self.cat.execute(
+                        f'SELECT id FROM inventory WHERE deleted=0 AND id IN ({marks})', wanted)}
+                    wanted = [i for i in wanted if i not in have]
                 loaded = set()
                 if wanted:
                     marks = ','.join('?' for _ in wanted)

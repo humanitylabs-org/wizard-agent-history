@@ -38,8 +38,20 @@ class Result:
         return iter(self.rows)
 
 
+# Set by the CLI when the History process itself is the far end of a bridge:
+# its original stdout carries RPC requests, its stdin carries responses.
+STDIO = None
+
+
 class RemoteSource:
     def __init__(self, config):
+        if 'stdio' in config:
+            if STDIO is None:
+                raise ValueError('stdio source requires the bridged CLI')
+            self.process = None
+            self.reader, self.writer = STDIO
+            self.info = self.rpc({'method': 'info'})
+            return
         host = config['ssh']
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]*', host):
             raise ValueError('invalid SSH host alias')
@@ -49,12 +61,13 @@ class RemoteSource:
         self.process = subprocess.Popen(['ssh', '-C', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15',
             '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3', host, command],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.reader, self.writer = self.process.stdout, self.process.stdin
         self.info = self.rpc({'method': 'info'})
 
     def rpc(self, request):
-        self.process.stdin.write(canonical(request) + b'\n')
-        self.process.stdin.flush()
-        line = self.process.stdout.readline()
+        self.writer.write(canonical(request) + b'\n')
+        self.writer.flush()
+        line = self.reader.readline()
         if not line:
             raise RuntimeError('SSH source ended without a response')
         result = unjson(line)
@@ -66,6 +79,8 @@ class RemoteSource:
         return Result(self.rpc({'method': 'query', 'sql': sql, 'params': params}))
 
     def close(self):
+        if self.process is None:
+            return  # Bridged stdio is shared by every connection in this process.
         self.process.stdin.close()
         self.process.stdout.close()
         try:

@@ -89,6 +89,27 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.sync()['changed'], 1)
         self.assertEqual(self.h.search('violet')[0]['title'], 'Renamed synthetic title')
 
+    def test_bridged_stdio_sync(self):
+        # Source host dials out; archive host reads the source only over the pipe.
+        import json, subprocess, sys
+        self.add()
+        self.add(role='assistant', content='Synthetic tulip reply')
+        repo = Path(__file__).resolve().parents[1]
+        cfg = self.base / 'bridged.json'
+        cfg.write_text(json.dumps({'root': str(self.base / 'bridged'), 'agent': 'hermes',
+                                   'source': {'stdio': 'synthetic'}}))
+        before = file_hash(self.source)
+        run = subprocess.run([sys.executable, '-m', 'ops.bridge', '--source', str(self.source), '--',
+                              sys.executable, '-m', 'agent_history', '--config', str(cfg), 'sync'],
+                             cwd=repo, capture_output=True, text=True, timeout=120,
+                             env=dict(__import__('os').environ, PYTHONPATH=str(repo)))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stderr.strip().splitlines()[-1])['changed'], 2)
+        self.assertEqual(run.stdout, '')
+        self.assertEqual(before, file_hash(self.source))
+        with History(self.base / 'bridged', writable=False) as h:
+            self.assertEqual(len(h.search('tulip')), 1)
+
     def test_hermes_query_syntax(self):
         # Agents send Hermes session_search syntax; History must accept it too.
         self.add(content='Synthetic chat-send violet garden: done (ok)')

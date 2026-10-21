@@ -91,6 +91,14 @@ def main(argv=None):
         serve(args.source)
         return
     cfg = json.loads(Path(args.config).expanduser().read_text()) if args.config else {}
+    out = sys.stdout
+    if isinstance(cfg.get('source'), dict) and 'stdio' in cfg['source']:
+        # Bridged run: fd 1 becomes the private RPC channel; everything printed,
+        # including the final result, goes to stderr.
+        from . import source_rpc
+        source_rpc.STDIO = (os.fdopen(os.dup(0), 'rb'), os.fdopen(os.dup(1), 'wb'))
+        os.dup2(2, 1)
+        sys.stdout = out = sys.stderr
     root = args.root or cfg.get('root')
     if not root:
         p.error('--root or config.root is required (no implicit live paths)')
@@ -120,7 +128,7 @@ def main(argv=None):
         else:
             mcp(h)
             return
-    print(canonical(result).decode())
+    print(canonical(result).decode(), file=out, flush=True)
 
 
 if __name__ == '__main__':
